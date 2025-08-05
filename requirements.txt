@@ -6,4 +6,6 @@ passlib[bcrypt]
 python-jose
 pydantic
 python-dotenv
+python-multipart
 # (plus any other packages you use for LLM, etc.)
+
