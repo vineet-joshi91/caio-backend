@@ -1,11 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-Created on Thu Jul 31 11:30:23 2025
-
-@author: Vineet
+CAIO SaaS API – main.py (Render/Production-ready version)
 """
-
-# main.py
 
 from fastapi import FastAPI, Depends, HTTPException, status, Request
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
@@ -21,7 +17,7 @@ from typing import Optional
 import uvicorn
 import os
 
-# If you're using Streamlit/React as frontend, set allowed origins accordingly
+# Allow CORS for local dev and deployed frontends
 origins = [
     "http://localhost",
     "http://localhost:3000",
@@ -47,7 +43,10 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="api/login")
 
 @app.on_event("startup")
 def startup():
-    init_db()  # Ensure DB tables exist on start
+    try:
+        init_db()  # Ensure DB tables exist on start
+    except Exception as e:
+        print(f"Database initialization failed: {e}")
 
 # --------- UTILS ---------
 
@@ -71,6 +70,15 @@ def log_usage(db: Session, user: User, tokens: int, endpoint: str, status: str =
     db.commit()
 
 # --------- ROUTES ---------
+
+@app.get("/")
+def root_health_check():
+    """Root endpoint for Render health check."""
+    return {"status": "ok", "message": "CAIO backend is running."}
+
+@app.get("/api/health")
+def api_health_check():
+    return {"status": "ok"}
 
 @app.post("/api/signup")
 def signup(email: str, password: str, db: Session = Depends(get_db)):
@@ -102,20 +110,18 @@ def get_profile(current_user: User = Depends(get_current_user)):
 
 @app.post("/api/analyze")
 async def analyze(request: Request, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    # Restrict analyze access to paid/admin users
     if not (current_user.is_paid or current_user.is_admin):
         raise HTTPException(status_code=402, detail="Payment required for full analysis access.")
     data = await request.json()
-    text = data.get("text")  # Could be file text or query
-    which_brains = data.get("brains", ["CFO", "COO", "CMO", "CHRO"])  # Optional
-    # Import your LLM/brains logic here
+    text = data.get("text")
+    which_brains = data.get("brains", ["CFO", "COO", "CMO", "CHRO"])
     from brains import analyze_cfo, analyze_cmo, analyze_coo, analyze_chro
     responses = {}
     tokens_used = 0
     if "CFO" in which_brains:
         result = analyze_cfo(text)
         responses["CFO"] = result
-        tokens_used += len(result) // 4  # (Approx token count)
+        tokens_used += len(result) // 4
     if "COO" in which_brains:
         result = analyze_coo(text)
         responses["COO"] = result
@@ -135,7 +141,6 @@ async def analyze(request: Request, current_user: User = Depends(get_current_use
 def admin_dashboard(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     if not is_admin(current_user):
         raise HTTPException(status_code=403, detail="Admin access required")
-    # Example admin stats
     user_count = db.query(User).count()
     paid_users = db.query(User).filter(User.is_paid.is_(True)).count()
     usage_logs = db.query(UsageLog).count()
@@ -147,12 +152,6 @@ def admin_dashboard(current_user: User = Depends(get_current_user), db: Session 
     }
 
 # -- Payment routes and Stripe webhook would go here (payments.py) --
-
-# --------- HEALTH CHECK ---------
-
-@app.get("/api/health")
-def health_check():
-    return {"status": "ok"}
 
 # --------- MAIN ---------
 
