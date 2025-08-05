@@ -15,7 +15,7 @@ from datetime import datetime
 # --- CONFIG ---
 
 # Get your Render DATABASE_URL from env (never hardcode in repo)
-POSTGRES_URL = os.environ.get("DATABASE_URL", "postgresql://user:pass@host:5432/dbname")
+POSTGRES_URL = os.environ.get("DATABASE_URL", "postgresql://user:password@host:5432/dbname")
 
 # For SSL support with Render Postgres (uncomment below if you get SSL errors)
 # engine = create_engine(POSTGRES_URL, connect_args={"sslmode": "require"})
@@ -56,3 +56,4 @@ def get_db():
         yield db
     finally:
         db.close()
+
