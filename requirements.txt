@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+sqlalchemy
+psycopg2-binary
+passlib[bcrypt]
+python-jose
+pydantic
+python-dotenv
+# (plus any other packages you use for LLM, etc.)
+python-multipart
+openai
