@@ -9,3 +9,4 @@ python-dotenv
 # (plus any other packages you use for LLM, etc.)
 python-multipart
 openai
+email-validator
