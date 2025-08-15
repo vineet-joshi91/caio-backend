@@ -1,75 +1,76 @@
 # -*- coding: utf-8 -*-
 """
-Created on Wed Jul 30 17:57:23 2025
+Created on Fri Aug 15 20:19:00 2025
 
 @author: Vineet
 """
 
-# auth.py
-
-from passlib.context import CryptContext
-from jose import JWTError, jwt
-from datetime import datetime, timedelta
-from db import User, get_db
-from sqlalchemy.orm import Session
+# auth.py  (put this next to main.py)
 import os
+from datetime import datetime, timedelta
+from typing import Optional
 
-# --- CONFIG ---
+from fastapi import Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordBearer
+from jose import JWTError, jwt
+from passlib.context import CryptContext
+from sqlalchemy.orm import Session
 
-SECRET_KEY = os.environ.get("CAIO_SECRET_KEY", "super-secret-dev-key")  # Set this in .env or Render for security!
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24  # 1 day
+from db import get_db, User  # User must have: email, hashed_password, is_admin, is_paid
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+# --- Config ---
+JWT_SECRET = os.getenv("JWT_SECRET", "change-me-in-prod")
+JWT_ALG = "HS256"
+ACCESS_TOKEN_EXPIRE_MIN = int(os.getenv("ACCESS_TOKEN_EXPIRE_MIN", "1440"))  # 24h
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/login")
+pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-# --- PASSWORD HASHING ---
 
-def hash_password(password: str) -> str:
-    return pwd_context.hash(password)
+# --- Password helpers ---
+def get_password_hash(password: str) -> str:
+    return pwd_ctx.hash(password)
+
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
-    return pwd_context.verify(plain_password, hashed_password)
-
-# --- JWT TOKEN HELPERS ---
-
-def create_access_token(data: dict, expires_delta: timedelta = None):
-    to_encode = data.copy()
-    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
-    to_encode.update({"exp": expire})
-    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-    return encoded_jwt
-
-def decode_access_token(token: str):
     try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        return payload
+        return pwd_ctx.verify(plain_password, hashed_password)
+    except Exception:
+        return False
+
+
+# --- Auth primitives ---
+def authenticate_user(email: str, password: str, db: Session = Depends(get_db)) -> Optional[User]:
+    user = db.query(User).filter(User.email == email).first()
+    if not user:
+        return None
+    hp = getattr(user, "hashed_password", None)
+    if not hp:
+        return None
+    if not verify_password(password, hp):
+        return None
+    return user
+
+
+def create_access_token(sub: str, expires_minutes: int = ACCESS_TOKEN_EXPIRE_MIN) -> str:
+    to_encode = {"sub": sub, "exp": datetime.utcnow() + timedelta(minutes=expires_minutes)}
+    return jwt.encode(to_encode, JWT_SECRET, algorithm=JWT_ALG)
+
+
+def _decode_token(token: str) -> str:
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG])
+        sub: str = payload.get("sub")
+        if not sub:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token payload")
+        return sub
     except JWTError:
-        return None
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
 
-# --- USER HELPERS ---
 
-def get_user_by_email(db: Session, email: str):
-    return db.query(User).filter(User.email == email.lower()).first()
-
-def authenticate_user(db: Session, email: str, password: str):
-    user = get_user_by_email(db, email)
-    if not user or not verify_password(password, user.hashed_password):
-        return None
+# --- FastAPI dependency used by main.py ---
+def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)) -> User:
+    email = _decode_token(token)
+    user = db.query(User).filter(User.email == email).first()
+    if not user:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
     return user
-
-def create_user(db: Session, email: str, password: str, is_admin=False):
-    user = User(
-        email=email.lower(),
-        hashed_password=hash_password(password),
-        is_admin=is_admin,
-    )
-    db.add(user)
-    db.commit()
-    db.refresh(user)
-    return user
-
-def is_admin(user: User):
-    return user.is_admin if user else False
-
-def is_paid(user: User):
-    return user.is_paid if user else False

@@ -10,3 +10,4 @@ python-dotenv
 python-multipart
 openai
 email-validator
+python-jose[cryptography]
