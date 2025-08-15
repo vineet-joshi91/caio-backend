@@ -23,6 +23,21 @@ from auth import (
     is_paid,
 )
 
+# --- SAFE ADMIN ROUTER INCLUDE (add this in main.py after `app = FastAPI()` and CORS setup) ---
+# This will never crash the app if the file is missing or has an import error.
+# It logs a warning instead, so your current API keeps running.
+
+import logging
+logger = logging.getLogger("uvicorn.error")  # Render/uvicorn logger
+
+try:
+    from admin_routes import router as admin_router  # the file we created
+    app.include_router(admin_router, prefix="/api/admin", tags=["admin"])
+    logger.info("Admin router loaded at /api/admin")
+except Exception as e:
+    logger.warning(f"Admin router NOT loaded: {e}")
+# --- END SAFE ADMIN ROUTER INCLUDE ---
+
 # ---------- CORS ----------
 
 def _parse_allowed_origins() -> list[str]:
@@ -229,3 +244,6 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=int(os.environ.get("PORT", 8000)),
     )
+    
+    
+
