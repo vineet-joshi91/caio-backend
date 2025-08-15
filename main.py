@@ -46,24 +46,36 @@ except Exception as e:
 
 # ---- Auth wiring ----
 try:
-    from auth import authenticate_user, create_access_token, get_current_user  # type: ignore
-    # optional helper for hashing if you exposed it
+    # try common names used across tutorials/boilerplates
+    try:
+        from auth import get_current_user  # type: ignore
+    except Exception:
+        from auth import get_current_active_user as get_current_user  # type: ignore
+
+    # optional helpers; ignore if absent
+    try:
+        from auth import authenticate_user  # type: ignore
+    except Exception:
+        authenticate_user = None  # type: ignore
+
+    try:
+        from auth import create_access_token  # type: ignore
+    except Exception:
+        create_access_token = None  # type: ignore
+
     try:
         from auth import get_password_hash  # type: ignore
     except Exception:
         get_password_hash = None  # type: ignore
+
 except Exception as e:
     logger.warning(f"Auth imports unavailable: {e}")
 
-    def get_current_user():
+    def get_current_user():  # type: ignore
         raise HTTPException(status_code=401, detail="Auth not configured")
 
-    def authenticate_user(email: str, password: str):
-        return None
-
-    def create_access_token(sub: str):
-        return "token"
-
+    authenticate_user = None  # type: ignore
+    create_access_token = None  # type: ignore
     get_password_hash = None  # type: ignore
 
 # ---- Health ----
@@ -127,9 +139,8 @@ def signup(
 # ---- Login ----
 @app.post("/api/login")
 def login(form: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
-    """
-    Expects form fields username + password (x-www-form-urlencoded).
-    """
+    if authenticate_user is None or create_access_token is None:
+        raise HTTPException(status_code=500, detail="Auth functions not available")
     user = authenticate_user(form.username, form.password)
     if not user:
         raise HTTPException(status_code=400, detail="Incorrect email or password")
