@@ -137,13 +137,24 @@ def signup(
         raise HTTPException(status_code=500, detail="Signup failed")
 
 # ---- Login ----
+
+from fastapi.security import OAuth2PasswordRequestForm
+from sqlalchemy.orm import Session
+
 @app.post("/api/login")
-def login(form: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+def login(
+    form: OAuth2PasswordRequestForm = Depends(),
+    db: Session = Depends(get_db),
+):
+    # guard missing funcs
     if authenticate_user is None or create_access_token is None:
         raise HTTPException(status_code=500, detail="Auth functions not available")
-    user = authenticate_user(form.username, form.password)
+
+    # ✅ pass the DB session into authenticate_user
+    user = authenticate_user(form.username, form.password, db)  # <— FIXED
     if not user:
         raise HTTPException(status_code=400, detail="Incorrect email or password")
+
     token = create_access_token(sub=getattr(user, "email", form.username))
     return {"access_token": token, "token_type": "bearer"}
 
