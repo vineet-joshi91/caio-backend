@@ -233,3 +233,11 @@ try:
     logger.info("Payments router loaded at /api/payments")
 except Exception as e:
     logger.warning(f"Payments router NOT loaded: {e}")
+
+# ---- Dev router (bootstrap) ----
+try:
+    from dev_routes import router as dev_router  # type: ignore
+    app.include_router(dev_router, prefix="/api/dev", tags=["dev"])
+    logger.info("Dev router loaded at /api/dev")
+except Exception as e:
+    logger.warning(f"Dev router NOT loaded: {e}")
