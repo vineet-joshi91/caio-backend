@@ -1,10 +1,3 @@
-# -*- coding: utf-8 -*-
-"""
-Created on Fri Aug 15 20:19:00 2025
-
-@author: Vineet
-"""
-
 # auth.py  (put this next to main.py)
 import os
 from datetime import datetime, timedelta
