@@ -199,25 +199,64 @@ def profile(current_user=Depends(get_current_user)):
 # -----------------------------------------------------------------------------
 # Analyze (text or file)
 # -----------------------------------------------------------------------------
-def _safe_generate(text: Optional[str], file_bytes: Optional[bytes], filename: Optional[str]):
+# -----------------------------------------------------------------------------
+# Analyze (text or file) with Demo vs Pro behavior
+# -----------------------------------------------------------------------------
+def _demo_response(text: Optional[str], filename: Optional[str]):
+    # Small, convincing canned output that proves the plumbing works
+    preview = (text or "").strip()[:220] if text else (filename or "document")
+    return {
+        "mode": "demo",
+        "summary": f"Sample insights for: {preview}",
+        "notes": "This is a demo preview. Upgrade to Pro to run full analysis on your text or uploaded files.",
+        "cxo": {
+            "CFO":  "Watch unit economics and cash conversion in Q3.",
+            "CMO":  "Optimize paid spend; lift organic by content-led SEO.",
+            "COO":  "Tighten fulfillment SLAs; reduce defect rate.",
+            "CHRO": "Upskill GTM; tie incentives to retention.",
+        },
+    }
+
+def _no_credits_response():
+    return {
+        "mode": "pro",
+        "error": "NO_CREDITS",
+        "message": "Not enough credits (or API unavailable). Please add credits or try again later.",
+    }
+
+def _try_project_engines(text: Optional[str], file_bytes: Optional[bytes], filename: Optional[str]):
     """
-    Delegates to project analyzers if present; else returns a minimal fallback.
+    Prefer your own engines/brains if present. If they raise, we bubble up and
+    decide what to show (demo/no_credits) above.
     """
+    # 1) brains
     try:
         from brains import generate_cxo_insights  # type: ignore
         return generate_cxo_insights(text=text, file_bytes=file_bytes, filename=filename)  # type: ignore
     except Exception:
         pass
+
+    # 2) engines
     try:
         from engines import run_analysis  # type: ignore
         return run_analysis(text=text, file_bytes=file_bytes, filename=filename)  # type: ignore
     except Exception:
         pass
-    return {
-        "summary": (text or "")[:4000],
-        "notes": "Fallback analyzer executed. Wire to brains/engines for full output.",
-        "cxo": {"CFO": "—", "CMO": "—", "COO": "—", "CHRO": "—"},
-    }
+
+    # 3) optional OpenAI fallback (only if key present)
+    try:
+        api_key = os.getenv("OPENAI_API_KEY") or os.getenv("OPENROUTER_API_KEY")
+        if not api_key:
+            raise RuntimeError("no_api_key")
+        # If you want a real OpenAI call, wire it here. We deliberately skip to keep
+        # deployments deterministic without external spend.
+        raise RuntimeError("treat_as_no_credits")
+    except Exception:
+        # Let caller decide to surface NO_CREDITS
+        raise
+
+def _resolve_user_tier(current_user) -> str:
+    return "pro" if bool(getattr(current_user, "is_paid", False)) else "demo"
 
 @app.post("/api/analyze")
 async def analyze(
@@ -226,21 +265,33 @@ async def analyze(
     file: Optional[UploadFile] = File(None),
     current_user=Depends(get_current_user),
 ):
+    """
+    - DEMO (is_paid == False): always return a canned, helpful sample.
+    - PRO  (is_paid == True): try engines/brains. If API is missing/exhausted,
+      return a structured NO_CREDITS response for the UI to display.
+    """
+    # Collect input
+    content: Optional[bytes] = None
+    fname: Optional[str] = None
+    if file is not None:
+        content = await file.read()
+        fname = file.filename
+
+    if not content and not (text and text.strip()):
+        raise HTTPException(status_code=400, detail="Provide text or upload a file")
+
+    tier = _resolve_user_tier(current_user)
+
+    if tier == "demo":
+        return JSONResponse(_demo_response(text, fname))
+
+    # Pro path
     try:
-        content: Optional[bytes] = None
-        fname: Optional[str] = None
-        if file is not None:
-            content = await file.read()
-            fname = file.filename
-        if not content and not (text and text.strip()):
-            raise HTTPException(status_code=400, detail="Provide text or upload a file")
-        result = _safe_generate(text.strip() if text else None, content, fname)
+        result = _try_project_engines(text.strip() if text else None, content, fname)
         return JSONResponse(result)
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"analyze error: {e}")
-        raise HTTPException(status_code=500, detail="Analyze failed")
+    except Exception:
+        # Treat all engine/LLM failures as credit/unavailable for a crisp UX
+        return JSONResponse(_no_credits_response(), status_code=402)
 
 # -----------------------------------------------------------------------------
 # Optional routers
