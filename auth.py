@@ -12,7 +12,8 @@ from sqlalchemy.orm import Session
 from db import get_db, User  # User must have: email, hashed_password, is_admin, is_paid
 
 # --- Config ---
-JWT_SECRET = os.getenv("JWT_SECRET", "change-me-in-prod")
+# Prefer JWT_SECRET if present, else fall back to SECRET_KEY (your existing env).
+JWT_SECRET = os.getenv("JWT_SECRET") or os.getenv("SECRET_KEY") or "change-me-in-prod"
 JWT_ALG = "HS256"
 ACCESS_TOKEN_EXPIRE_MIN = int(os.getenv("ACCESS_TOKEN_EXPIRE_MIN", "1440"))  # 24h
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/login")
