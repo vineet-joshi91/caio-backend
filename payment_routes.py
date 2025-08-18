@@ -1,8 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-Created on Sun Aug 17 12:22:49 2025
-
-@author: Vineet
+Payments routes for CAIO — Razorpay create-order + webhook.
+Namespace: /api/payments/*
 """
 
 import os
@@ -11,30 +10,31 @@ import base64
 import hmac
 import hashlib
 import logging
-from typing import Optional, Dict, Any
+from typing import Optional, Dict
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request, Body
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
+from sqlalchemy import text
 
-# Your project modules
+# Project modules
 from db import get_db, User  # type: ignore
 from auth import get_current_user  # type: ignore
 
-router = APIRouter()
-
 log = logging.getLogger("uvicorn.error")
 
-# ---- Environment ----
+# -------------------- Env --------------------
 KEY_ID = os.getenv("RAZORPAY_KEY_ID", "")
 KEY_SECRET = os.getenv("RAZORPAY_SECRET", "")
 WEBHOOK_SECRET = os.getenv("RAZORPAY_WEBHOOK_SECRET", "")
-
-# Default plan settings (you can change these)
 DEFAULT_CURRENCY = os.getenv("RAZORPAY_CURRENCY", "INR")
-# Amount in paise: ₹499.00 -> 49900
-DEFAULT_AMOUNT_PAISE = int(os.getenv("RAZORPAY_DEFAULT_AMOUNT_PAISE", "49900"))
+
+# Plans in paise (₹ -> x100)
+PLAN_INR = {
+    "pro": int(os.getenv("RAZORPAY_PLAN_PRO_PAISE", "49900")),         # ₹499.00
+    "premium": int(os.getenv("RAZORPAY_PLAN_PREMIUM_PAISE", "149900")), # ₹1499.00
+}
 
 RAZORPAY_API = "https://api.razorpay.com/v1"
 
@@ -45,50 +45,53 @@ def _assert_configured() -> None:
 
 
 def _basic_auth_header() -> Dict[str, str]:
-    token = base64.b64encode(f"{KEY_ID}:{KEY_SECRET}".encode()).decode()
-    return {"Authorization": f"Basic {token}"}
+    tok = base64.b64encode(f"{KEY_ID}:{KEY_SECRET}".encode()).decode()
+    return {"Authorization": f"Basic {tok}"}
 
 
-# ---- Public config for frontend (no secrets) ----
+router = APIRouter(prefix="/api/payments", tags=["payments"])
+
+# -------------------- Public (no secrets) --------------------
 @router.get("/config")
 def payments_config():
     """
-    Frontend can call this to know whether payments are enabled and which key id to use.
+    Frontend fetches this to initialize Razorpay Checkout.
     """
-    if not KEY_ID:
-        raise HTTPException(500, "Payments not configured")
-    return {"key_id": KEY_ID, "currency": DEFAULT_CURRENCY}
+    _assert_configured()
+    return {"key_id": KEY_ID, "currency": DEFAULT_CURRENCY, "plans": list(PLAN_INR.keys())}
 
 
-# ---- Create an order for the logged-in user ----
+# -------------------- Create Order --------------------
 @router.post("/create-order")
 def create_order(
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),
-    # Allow overriding amount from frontend if you want (defaults to Pro plan).
-    amount_paise: Optional[int] = Body(None, embed=True),
     plan: Optional[str] = Body(None, embed=True),
+    amount_paise: Optional[int] = Body(None, embed=True),
 ):
     """
-    Creates a Razorpay Order (one-time Pro purchase).
-    - Associates the order with the user via notes.email
-    - Returns order_id and meta for Checkout
+    Creates a Razorpay Order for the logged-in user.
+    - Associates the order with user via 'notes.email' (and 'receipt')
+    - Defaults to the chosen plan (pro/premium) if amount not provided
     """
     _assert_configured()
 
-    amt = amount_paise or DEFAULT_AMOUNT_PAISE
-    if amt <= 0:
-        raise HTTPException(400, "Invalid amount")
+    plan = (plan or "pro").lower().strip()
+    amt = amount_paise if (amount_paise and amount_paise > 0) else PLAN_INR.get(plan)
+    if not amt or amt <= 0:
+        raise HTTPException(400, "Invalid amount/plan")
 
-    receipt = f"caio-{current_user.email}-{int(time.time())}"
+    # Unique receipt helps us tie payment->user on the webhook, even if notes go missing
+    receipt = f"caio:{current_user.email}:{plan}:{int(time.time())}"
+
     payload = {
         "amount": amt,
         "currency": DEFAULT_CURRENCY,
         "receipt": receipt,
-        "payment_capture": 1,  # auto-capture after auth
+        "payment_capture": 1,  # auto-capture after authorization
         "notes": {
             "email": current_user.email,
-            "plan": plan or "pro",
+            "plan": plan,
         },
     }
 
@@ -105,18 +108,23 @@ def create_order(
         log.exception("create_order error: %s", e)
         raise HTTPException(502, "Payment provider unavailable")
 
-    # Minimal payload for your frontend Checkout
+    # You can also persist order->user mapping server-side here if you want
+    # db.execute(text("INSERT ..."))  # optional
+
     return {
         "order_id": data.get("id"),
         "amount": data.get("amount"),
         "currency": data.get("currency"),
         "key_id": KEY_ID,
+        "plan": plan,
+        "email": current_user.email,
     }
 
 
+# -------------------- Helpers --------------------
 def _verify_webhook_signature(raw_body: bytes, signature: str) -> bool:
     """
-    Razorpay sends X-Razorpay-Signature (hex). We compute HMAC SHA256 over raw body.
+    Razorpay sends X-Razorpay-Signature (hex). Compute HMAC SHA256 over raw body.
     """
     if not WEBHOOK_SECRET or not signature:
         return False
@@ -131,7 +139,7 @@ def _mark_user_paid_by_email(db: Session, email: Optional[str]) -> bool:
     if not user:
         return False
     if getattr(user, "is_paid", False):
-        return True  # already paid (idempotent)
+        return True  # idempotent
     try:
         user.is_paid = True  # type: ignore
         db.add(user)         # type: ignore
@@ -143,14 +151,46 @@ def _mark_user_paid_by_email(db: Session, email: Optional[str]) -> bool:
         return False
 
 
-# ---- Webhook endpoint (Razorpay -> CAIO) ----
-@router.post("/webhook")
-async def webhook(request: Request, db: Session = Depends(get_db)):
+def _extract_email_from_payload(payload: dict) -> Optional[str]:
+    """
+    Try multiple paths to find the purchaser's email.
+    1) payment.entity.notes.email
+    2) order.entity.notes.email
+    3) payment.entity.email (fallback if notes missing)
+    4) order.entity.receipt -> 'caio:<email>:<plan>:<ts>'
+    """
+    try:
+        pay = (payload.get("payment") or {}).get("entity") or {}
+        email = (pay.get("notes") or {}).get("email") or pay.get("email")
+        if email:
+            return email.strip().lower()
+    except Exception:
+        pass
+
+    try:
+        order = (payload.get("order") or {}).get("entity") or {}
+        email = (order.get("notes") or {}).get("email")
+        if email:
+            return email.strip().lower()
+        receipt = (order.get("receipt") or "").strip()
+        if receipt.startswith("caio:"):
+            parts = receipt.split(":")
+            if len(parts) >= 3:
+                return parts[1].strip().lower()
+    except Exception:
+        pass
+
+    return None
+
+
+# -------------------- Webhook (Razorpay -> CAIO) --------------------
+async def _webhook_handler(request: Request, db: Session) -> JSONResponse:
     """
     Configure in Razorpay Dashboard:
-      URL: https://<your-backend>/api/payments/webhook
-      Secret: <RAZORPAY_WEBHOOK_SECRET>
-      Events: order.paid, payment.captured
+      URL   : https://<backend>/api/payments/webhook   (preferred)
+              or https://<backend>/razorpay-webhook    (legacy alias)
+      Secret: RAZORPAY_WEBHOOK_SECRET
+      Events: payment.captured, payment.failed          (+ order.paid if desired)
     """
     raw = await request.body()
     signature = request.headers.get("X-Razorpay-Signature", "")
@@ -166,32 +206,38 @@ async def webhook(request: Request, db: Session = Depends(get_db)):
 
     etype = event.get("event", "")
     payload = event.get("payload", {}) or {}
+    email = _extract_email_from_payload(payload)
 
-    # Try to find user's email (we put it into notes at order creation)
-    email: Optional[str] = None
-
-    # order path
-    try:
-        order_entity = payload.get("order", {}).get("entity", {}) or {}
-        email = (order_entity.get("notes") or {}).get("email") or email
-    except Exception:
-        pass
-
-    # payment path (some webhooks only include payment)
-    try:
-        payment_entity = payload.get("payment", {}).get("entity", {}) or {}
-        email = (payment_entity.get("notes") or {}).get("email") or email
-        # Fallback to payment.email if notes were stripped
-        email = payment_entity.get("email") or email
-    except Exception:
-        pass
-
-    if etype in ("order.paid", "payment.captured") and email:
+    if etype in ("payment.captured", "order.paid") and email:
         ok = _mark_user_paid_by_email(db, email)
         log.info("Webhook %s for %s -> paid=%s", etype, email, ok)
-        # Always 200 so Razorpay doesn't retry forever
         return JSONResponse({"ok": True})
 
-    # Other events — acknowledge with 200
+    if etype == "payment.failed" and email:
+        # Optional: record failure
+        try:
+            db.execute(text(
+                "INSERT INTO payments_log (email, status) VALUES (:email, 'failed')"
+            ), {"email": email})
+            db.commit()
+        except Exception:
+            db.rollback()
+        log.info("Webhook payment.failed for %s", email)
+        return JSONResponse({"ok": True})
+
+    # Acknowledge all other events so Razorpay doesn't retry forever
     log.info("Webhook received: %s (no action)", etype)
     return JSONResponse({"ok": True})
+
+
+@router.post("/webhook")
+async def webhook(request: Request, db: Session = Depends(get_db)):
+    return await _webhook_handler(request, db)
+
+
+# Legacy alias to match dashboards already pointing here:
+from fastapi import APIRouter as _AR  # avoid linter warning
+_alias = _AR()
+@_alias.post("/razorpay-webhook")
+async def webhook_alias(request: Request, db: Session = Depends(get_db)):
+    return await _webhook_handler(request, db)
