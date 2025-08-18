@@ -1,1 +1,11 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.eggs/
+.build/
+dist/
+
+# Secrets
 .env
