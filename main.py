@@ -29,7 +29,7 @@ if not ALLOWED_ORIGINS:
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=True,           # okay even if you also send Authorization headers
+    allow_credentials=True,           # ok with Authorization header
     allow_methods=["*"],              # includes OPTIONS
     allow_headers=["*"],
     expose_headers=["*"],
@@ -197,13 +197,9 @@ def profile(current_user=Depends(get_current_user)):
         raise HTTPException(status_code=500, detail="profile error")
 
 # -----------------------------------------------------------------------------
-# Analyze (text or file)
-# -----------------------------------------------------------------------------
-# -----------------------------------------------------------------------------
 # Analyze (text or file) with Demo vs Pro behavior
 # -----------------------------------------------------------------------------
 def _demo_response(text: Optional[str], filename: Optional[str]):
-    # Small, convincing canned output that proves the plumbing works
     preview = (text or "").strip()[:220] if text else (filename or "document")
     return {
         "mode": "demo",
@@ -211,7 +207,7 @@ def _demo_response(text: Optional[str], filename: Optional[str]):
         "notes": "This is a demo preview. Upgrade to Pro to run full analysis on your text or uploaded files.",
         "cxo": {
             "CFO":  "Watch unit economics and cash conversion in Q3.",
-            "CMO":  "Optimize paid spend; lift organic by content-led SEO.",
+            "CMO":  "Optimize paid spend; lift organic via content-led SEO.",
             "COO":  "Tighten fulfillment SLAs; reduce defect rate.",
             "CHRO": "Upskill GTM; tie incentives to retention.",
         },
@@ -270,7 +266,6 @@ async def analyze(
     - PRO  (is_paid == True): try engines/brains. If API is missing/exhausted,
       return a structured NO_CREDITS response for the UI to display.
     """
-    # Collect input
     content: Optional[bytes] = None
     fname: Optional[str] = None
     if file is not None:
@@ -285,12 +280,10 @@ async def analyze(
     if tier == "demo":
         return JSONResponse(_demo_response(text, fname))
 
-    # Pro path
     try:
         result = _try_project_engines(text.strip() if text else None, content, fname)
         return JSONResponse(result)
     except Exception:
-        # Treat all engine/LLM failures as credit/unavailable for a crisp UX
         return JSONResponse(_no_credits_response(), status_code=402)
 
 # -----------------------------------------------------------------------------
