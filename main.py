@@ -1,14 +1,14 @@
 # main.py
 import os
 import logging
+from datetime import datetime
 from typing import Optional
 
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Request
-from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy.orm import Session
+from fastapi.responses import JSONResponse
 from fastapi.security import OAuth2PasswordRequestForm
-from datetime import datetime
+from sqlalchemy.orm import Session
 
 from db import get_db, User
 from auth import (
@@ -33,7 +33,7 @@ def _origins():
     raw = os.getenv("ALLOWED_ORIGINS")
     if raw:
         return [o.strip() for o in raw.split(",") if o.strip()]
-    # sensible defaults for your stack
+    # sensible defaults
     return [
         "https://caio-frontend.vercel.app",
         "https://caioai.netlify.app",
@@ -66,11 +66,14 @@ def health():
 # Auth: login (auto‑provision demo users; admin via ADMIN_EMAILS)
 # -----------------------------------------------------------------------------
 ADMIN_EMAILS = {
-    e.strip().lower() for e in os.getenv("ADMIN_EMAILS", "vineetpjoshi.71@gmail.com").split(",") if e.strip()
+    e.strip().lower()
+    for e in os.getenv("ADMIN_EMAILS", "vineetpjoshi.71@gmail.com").split(",")
+    if e.strip()
 }
 
 @app.post("/api/login")
-def login(form: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+def login(form: OAuth2PasswordRequestForm = Depends(),
+          db: Session = Depends(get_db)):
     email = form.username.strip().lower()
     password = form.password
 
@@ -87,7 +90,7 @@ def login(form: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get
             hashed_password=get_password_hash(password),
             is_admin=(email in ADMIN_EMAILS),
             is_paid=False,
-            created_at=getattr(User, "created_at", None) and datetime.utcnow() or None,  # set if column exists
+            created_at=getattr(User, "created_at", None) and datetime.utcnow() or None,
         )
         db.add(user)
         db.commit()
@@ -115,11 +118,8 @@ def profile(current_user: User = Depends(get_current_user)):
     }
 
 # -----------------------------------------------------------------------------
-# Analyze (minimal stub: Demo returns sample; Pro returns ‘no credits’ placeholder)
-# Keep this until your real pipeline is wired. Frontend already copes with 402.
+# Analyze (Demo returns sample; Pro returns friendly 402 placeholder)
 # -----------------------------------------------------------------------------
-# main.py (only the analyze endpoint, rest stays same)
-
 @app.post("/api/analyze")
 async def analyze(
     request: Request,
@@ -136,12 +136,12 @@ async def analyze(
                 "status": "demo",
                 "title": "Demo Mode Result",
                 "summary": "This is a sample analysis. Upgrade to Pro for full insights.",
-                "tip": "Upload a business document or upgrade your plan to unlock advanced engines."
+                "tip": "Upload a business document or upgrade your plan to unlock advanced engines.",
             },
             status_code=200,
         )
 
-    # Pro but no credits → friendly error
+    # Pro but no credits / engines disabled → friendly error used by frontend
     return JSONResponse(
         {
             "status": "error",
@@ -151,11 +151,12 @@ async def analyze(
         },
         status_code=402,
     )
+
 # -----------------------------------------------------------------------------
-# Mount sub‑routers
+# Routers (mounted once)
 # -----------------------------------------------------------------------------
 try:
-    from payment_routes import router as payments_router  # your file name is payment_routes.py
+    from payment_routes import router as payments_router
     app.include_router(payments_router, prefix="/api/payments", tags=["payments"])
     logger.info("Payments router loaded at /api/payments")
 except Exception as e:
