@@ -1,12 +1,12 @@
 # main.py
 import os
 import logging
-from datetime import datetime
 from typing import Optional
+from datetime import datetime
 
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Request
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
 
@@ -33,7 +33,7 @@ def _origins():
     raw = os.getenv("ALLOWED_ORIGINS")
     if raw:
         return [o.strip() for o in raw.split(",") if o.strip()]
-    # sensible defaults
+    # sensible defaults for your stack
     return [
         "https://caio-frontend.vercel.app",
         "https://caioai.netlify.app",
@@ -63,7 +63,7 @@ def health():
     return {"status": "ok"}
 
 # -----------------------------------------------------------------------------
-# Auth: login (auto‑provision demo users; admin via ADMIN_EMAILS)
+# Auth: login (auto-provision demo users; admin via ADMIN_EMAILS)
 # -----------------------------------------------------------------------------
 ADMIN_EMAILS = {
     e.strip().lower()
@@ -72,8 +72,7 @@ ADMIN_EMAILS = {
 }
 
 @app.post("/api/login")
-def login(form: OAuth2PasswordRequestForm = Depends(),
-          db: Session = Depends(get_db)):
+def login(form: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
     email = form.username.strip().lower()
     password = form.password
 
@@ -90,7 +89,7 @@ def login(form: OAuth2PasswordRequestForm = Depends(),
             hashed_password=get_password_hash(password),
             is_admin=(email in ADMIN_EMAILS),
             is_paid=False,
-            created_at=getattr(User, "created_at", None) and datetime.utcnow() or None,
+            created_at=datetime.utcnow(),
         )
         db.add(user)
         db.commit()
@@ -118,7 +117,7 @@ def profile(current_user: User = Depends(get_current_user)):
     }
 
 # -----------------------------------------------------------------------------
-# Analyze (Demo returns sample; Pro returns friendly 402 placeholder)
+# Analyze (Demo vs Pro stub)
 # -----------------------------------------------------------------------------
 @app.post("/api/analyze")
 async def analyze(
@@ -141,7 +140,7 @@ async def analyze(
             status_code=200,
         )
 
-    # Pro but no credits / engines disabled → friendly error used by frontend
+    # Pro but no credits → friendly error
     return JSONResponse(
         {
             "status": "error",
@@ -153,7 +152,7 @@ async def analyze(
     )
 
 # -----------------------------------------------------------------------------
-# Routers (mounted once)
+# Routers (Payments, Admin, Dev)
 # -----------------------------------------------------------------------------
 try:
     from payment_routes import router as payments_router
