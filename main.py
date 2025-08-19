@@ -118,6 +118,8 @@ def profile(current_user: User = Depends(get_current_user)):
 # Analyze (minimal stub: Demo returns sample; Pro returns ‘no credits’ placeholder)
 # Keep this until your real pipeline is wired. Frontend already copes with 402.
 # -----------------------------------------------------------------------------
+# main.py (only the analyze endpoint, rest stays same)
+
 @app.post("/api/analyze")
 async def analyze(
     request: Request,
@@ -127,30 +129,28 @@ async def analyze(
 ):
     text = (text or "").strip()
 
-    # If you want to parse files, you can import your parser here.
-    # from parser import parse_file
-    # content = text
-    # if file is not None:
-    #     content += "\n\n" + parse_file(file.file)
-
     if not current_user.is_paid:
-        # Demo mode: return deterministic sample
-        sample = {
-            "mode": "demo",
-            "summary": "Demo analysis sample. Upgrade to Pro for full insights.",
-        }
-        return JSONResponse(sample, status_code=200)
+        # Demo mode → return sample result
+        return JSONResponse(
+            {
+                "status": "demo",
+                "title": "Demo Mode Result",
+                "summary": "This is a sample analysis. Upgrade to Pro for full insights.",
+                "tip": "Upload a business document or upgrade your plan to unlock advanced engines."
+            },
+            status_code=200,
+        )
 
-    # Pro but engines/credits not wired → return friendly 402 used by your frontend
+    # Pro but no credits → friendly error
     return JSONResponse(
         {
-            "mode": "pro",
-            "error": "NO_CREDITS",
-            "message": "Not enough credits (or API unavailable). Please add credits or try again later.",
+            "status": "error",
+            "title": "Analysis Unavailable",
+            "message": "You’ve run out of credits or the AI engine is unavailable right now.",
+            "action": "Please add credits or try again later.",
         },
         status_code=402,
     )
-
 # -----------------------------------------------------------------------------
 # Mount sub‑routers
 # -----------------------------------------------------------------------------
