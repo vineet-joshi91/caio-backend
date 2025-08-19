@@ -1,4 +1,4 @@
-# auth.py  (put this next to main.py)
+# auth.py
 import os
 from datetime import datetime, timedelta
 from typing import Optional
@@ -9,21 +9,23 @@ from jose import JWTError, jwt
 from passlib.context import CryptContext
 from sqlalchemy.orm import Session
 
-from db import get_db, User  # User must have: email, hashed_password, is_admin, is_paid
+from db import get_db, User  # User: email, hashed_password, is_admin, is_paid
 
-# --- Config ---
-# Prefer JWT_SECRET if present, else fall back to SECRET_KEY (your existing env).
+# -----------------------------------------------------------------------------
+# Config
+# -----------------------------------------------------------------------------
 JWT_SECRET = os.getenv("JWT_SECRET") or os.getenv("SECRET_KEY") or "change-me-in-prod"
 JWT_ALG = "HS256"
-ACCESS_TOKEN_EXPIRE_MIN = int(os.getenv("ACCESS_TOKEN_EXPIRE_MIN", "1440"))  # 24h
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/login")
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "10080"))  # 7 days
+
 pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/login")
 
-
-# --- Password helpers ---
+# -----------------------------------------------------------------------------
+# Password helpers
+# -----------------------------------------------------------------------------
 def get_password_hash(password: str) -> str:
     return pwd_ctx.hash(password)
-
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     try:
@@ -31,37 +33,28 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
     except Exception:
         return False
 
-
-# --- Auth primitives ---
-def authenticate_user(email: str, password: str, db: Session = Depends(get_db)) -> Optional[User]:
-    user = db.query(User).filter(User.email == email).first()
-    if not user:
-        return None
-    hp = getattr(user, "hashed_password", None)
-    if not hp:
-        return None
-    if not verify_password(password, hp):
-        return None
-    return user
-
-
-def create_access_token(sub: str, expires_minutes: int = ACCESS_TOKEN_EXPIRE_MIN) -> str:
-    to_encode = {"sub": sub, "exp": datetime.utcnow() + timedelta(minutes=expires_minutes)}
+# -----------------------------------------------------------------------------
+# JWT primitives
+# -----------------------------------------------------------------------------
+def create_access_token(sub: str, expires_delta: Optional[timedelta] = None) -> str:
+    to_encode = {"sub": sub}
+    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
+    to_encode.update({"exp": expire})
     return jwt.encode(to_encode, JWT_SECRET, algorithm=JWT_ALG)
-
 
 def _decode_token(token: str) -> str:
     try:
         payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG])
-        sub: str = payload.get("sub")
+        sub: Optional[str] = payload.get("sub")
         if not sub:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token payload")
         return sub
     except JWTError:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
 
-
-# --- FastAPI dependency used by main.py ---
+# -----------------------------------------------------------------------------
+# Dependency
+# -----------------------------------------------------------------------------
 def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)) -> User:
     email = _decode_token(token)
     user = db.query(User).filter(User.email == email).first()
