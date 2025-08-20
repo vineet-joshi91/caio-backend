@@ -19,7 +19,7 @@ from auth import (
 )
 
 # Routers
-from routes_public_config import router as public_cfg_router  # <-- geo-pricing (INR ₹1,999 vs USD $49)
+from routes_public_config import router as public_cfg_router  # <-- NEW import for pricing
 
 # -----------------------------------------------------------------------------
 # App & logging
@@ -36,7 +36,6 @@ def _origins():
     raw = os.getenv("ALLOWED_ORIGINS")
     if raw:
         return [o.strip() for o in raw.split(",") if o.strip()]
-    # sensible defaults for your stack
     return [
         "https://caio-frontend.vercel.app",
         "https://caioai.netlify.app",
@@ -66,7 +65,7 @@ def health():
     return {"status": "ok", "version": "0.1.0"}
 
 # -----------------------------------------------------------------------------
-# Auth: login (auto-provision demo users; admin via ADMIN_EMAILS)
+# Auth: login
 # -----------------------------------------------------------------------------
 ADMIN_EMAILS = {
     e.strip().lower()
@@ -82,11 +81,9 @@ def login(form: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get
     user = db.query(User).filter(User.email == email).first()
 
     if user:
-        # existing user → verify password
         if not verify_password(password, user.hashed_password):
             raise HTTPException(status_code=400, detail="Incorrect email or password")
     else:
-        # new user → create Demo account
         user = User(
             email=email,
             hashed_password=get_password_hash(password),
@@ -132,7 +129,6 @@ async def analyze(
     text = (text or "").strip()
 
     if not current_user.is_paid:
-        # Demo mode → return sample result
         return JSONResponse(
             {
                 "status": "demo",
@@ -143,7 +139,6 @@ async def analyze(
             status_code=200,
         )
 
-    # Pro but no credits → friendly error (adjust once credits/engines wired)
     return JSONResponse(
         {
             "status": "error",
@@ -155,9 +150,9 @@ async def analyze(
     )
 
 # -----------------------------------------------------------------------------
-# Routers (Public Config, Payments, Admin, Dev)
+# Routers
 # -----------------------------------------------------------------------------
-# Public config (geo-based pricing + flags) — used by Netlify landing hydration
+# Public config (geo-based pricing + flags)
 app.include_router(public_cfg_router, prefix="", tags=["public"])
 
 try:
