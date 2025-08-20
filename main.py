@@ -18,6 +18,9 @@ from auth import (
     get_current_user,
 )
 
+# Routers
+from routes_public_config import router as public_cfg_router  # <-- geo-pricing (INR ₹1,999 vs USD $49)
+
 # -----------------------------------------------------------------------------
 # App & logging
 # -----------------------------------------------------------------------------
@@ -60,7 +63,7 @@ def cors_preflight(path: str):
 # -----------------------------------------------------------------------------
 @app.get("/api/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "version": "0.1.0"}
 
 # -----------------------------------------------------------------------------
 # Auth: login (auto-provision demo users; admin via ADMIN_EMAILS)
@@ -140,7 +143,7 @@ async def analyze(
             status_code=200,
         )
 
-    # Pro but no credits → friendly error
+    # Pro but no credits → friendly error (adjust once credits/engines wired)
     return JSONResponse(
         {
             "status": "error",
@@ -152,8 +155,11 @@ async def analyze(
     )
 
 # -----------------------------------------------------------------------------
-# Routers (Payments, Admin, Dev)
+# Routers (Public Config, Payments, Admin, Dev)
 # -----------------------------------------------------------------------------
+# Public config (geo-based pricing + flags) — used by Netlify landing hydration
+app.include_router(public_cfg_router, prefix="", tags=["public"])
+
 try:
     from payment_routes import router as payments_router
     app.include_router(payments_router, prefix="/api/payments", tags=["payments"])
