@@ -13,7 +13,7 @@ router = APIRouter(prefix="/api/payments", tags=["payments"])
 # --- ENV ---
 RAZORPAY_KEY_ID   = os.getenv("RAZORPAY_KEY_ID")
 RAZORPAY_SECRET   = os.getenv("RAZORPAY_SECRET")
-WEBHOOK_SECRET    = os.getenv("RAZORPAY_WEBHOOK_SECRET")  # must match Razorpay dashboard webhook secret
+WEBHOOK_SECRET    = os.getenv("RAZORPAY_WEBHOOK_SECRET")  # must match Razorpay Dashboard webhook secret
 PUBLIC_CONFIG_URL = os.getenv("PUBLIC_CONFIG_URL", "https://caio-backend.onrender.com/api/public-config")
 
 if not (RAZORPAY_KEY_ID and RAZORPAY_SECRET):
@@ -24,7 +24,7 @@ rz = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_SECRET))
 # --- Helpers ---
 async def get_region_pricing(req: Request) -> tuple[str, int]:
     """
-    Reads region-aware Pro price from your public-config so frontend and backend stay in sync.
+    Reads region-aware Pro price from public-config so UI and server match.
     Returns (currency, amount_in_minor_units).
     """
     force = req.query_params.get("force")
@@ -36,22 +36,19 @@ async def get_region_pricing(req: Request) -> tuple[str, int]:
     currency = cfg.get("currency", "INR")
     pro = (cfg.get("plans") or {}).get("pro") or {}
     price_major = int(pro.get("price", 1999))
-    # Minor units
-    amount_minor = price_major * 100
+    amount_minor = price_major * 100  # INR paise or USD cents
     return currency, amount_minor
 
 # --- Routes ---
 
 @router.get("/config")
 async def payments_config(request: Request):
-    """
-    Frontend helper – returns public key and current currency from public-config.
-    """
+    """Frontend helper — returns public key and active currency."""
     try:
         currency, _ = await get_region_pricing(request)
         return {"key_id": RAZORPAY_KEY_ID, "currency": currency}
     except Exception as e:
-        logger.exception("config error")
+        logger.exception("payments_config error")
         raise HTTPException(status_code=500, detail=f"Payments config error: {e}")
 
 @router.post("/create-order")
@@ -60,9 +57,7 @@ async def create_order(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """
-    Creates a Razorpay order with correct amount for the user's region.
-    """
+    """Creates a Razorpay order with correct amount for region."""
     if not current_user:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -76,7 +71,6 @@ async def create_order(
             payment_capture=1,
             notes={"email": current_user.email, "plan": "pro"}
         ))
-
         return {
             "order_id": order["id"],
             "amount": order["amount"],
@@ -97,36 +91,26 @@ async def webhook(
     db: Session = Depends(get_db),
 ):
     """
-    Handles Razorpay webhooks. On payment.captured → set is_paid=True for user found in notes.email
+    Webhook: on payment.captured => mark user.is_paid = True (notes.email).
     """
     if not WEBHOOK_SECRET:
         raise HTTPException(status_code=500, detail="Webhook secret not configured")
 
     try:
-        body = await request.body()
-        payload = body.decode("utf-8")
-        # Verify signature (HMAC SHA256)
-        expected = hmac.new(WEBHOOK_SECRET.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
-        if not hmac.compare_digest(expected, (x_razorpay_signature or "")):
-            logger.warning("Invalid webhook signature")
+        body_bytes = await request.body()
+        payload = body_bytes.decode("utf-8")
+
+        # Verify signature per Razorpay docs
+        digest = hmac.new(WEBHOOK_SECRET.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(digest, (x_razorpay_signature or "")):
             return JSONResponse({"status": "invalid-signature"}, status_code=400)
 
         event = json.loads(payload)
         etype = event.get("event", "")
-        entity = (event.get("payload", {}).get("payment", {}) or {}).get("entity", {})
-        email = None
-        try:
-            # Prefer notes.email from payment entity if present
-            email = (entity.get("notes") or {}).get("email")
-            # If not present, try order payload
-            if not email:
-                order_entity = (event.get("payload", {}).get("order", {}) or {}).get("entity", {})
-                email = (order_entity.get("notes") or {}).get("email")
-        except Exception:
-            pass
+        pay_entity = (event.get("payload", {}).get("payment", {}) or {}).get("entity", {})
+        order_entity = (event.get("payload", {}).get("order", {}) or {}).get("entity", {})
 
-        logger.info(f"Webhook {etype} for {email}")
-
+        email = (pay_entity.get("notes") or {}).get("email") or (order_entity.get("notes") or {}).get("email")
         if etype == "payment.captured" and email:
             user = db.query(User).filter(User.email == email).first()
             if user:
@@ -134,21 +118,16 @@ async def webhook(
                 db.add(user)
                 db.commit()
                 return {"status": "ok", "updated": True}
-            else:
-                logger.warning(f"User not found for email {email}")
-                return {"status": "ok", "updated": False, "reason": "user-not-found"}
+            return {"status": "ok", "updated": False, "reason": "user-not-found"}
 
-        # Gracefully ignore other events
         return {"status": "ignored", "event": etype}
     except Exception as e:
-        logger.exception("Webhook processing error")
+        logging.exception("Webhook processing error")
         return JSONResponse({"status": "error", "detail": str(e)}, status_code=500)
 
 @router.get("/status")
-async def payment_status(current_user: User = Depends(get_current_user)):
-    """
-    Quick check from the app to see if the user is paid.
-    """
+async def status(current_user: User = Depends(get_current_user)):
+    """Quick check for app to know if the user is paid."""
     if not current_user:
         raise HTTPException(status_code=401, detail="Unauthorized")
     return {"email": current_user.email, "is_paid": bool(current_user.is_paid)}
