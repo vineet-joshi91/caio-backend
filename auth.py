@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 
 from db import get_db, User  # User: email, hashed_password, is_admin, is_paid
 
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------- 
 # Config
 # -----------------------------------------------------------------------------
 JWT_SECRET = os.getenv("JWT_SECRET") or os.getenv("SECRET_KEY") or "change-me-in-prod"
@@ -21,7 +21,7 @@ ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "1008
 pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/login")
 
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------- 
 # Password helpers
 # -----------------------------------------------------------------------------
 def get_password_hash(password: str) -> str:
@@ -33,7 +33,7 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
     except Exception:
         return False
 
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------- 
 # JWT primitives
 # -----------------------------------------------------------------------------
 def create_access_token(sub: str, expires_delta: Optional[timedelta] = None) -> str:
@@ -52,7 +52,7 @@ def _decode_token(token: str) -> str:
     except JWTError:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
 
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------- 
 # Dependency
 # -----------------------------------------------------------------------------
 def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)) -> User:
