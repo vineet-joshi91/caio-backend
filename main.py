@@ -24,6 +24,10 @@ logging.basicConfig(level=logging.INFO)
 
 app = FastAPI(title="CAIO Backend", version="0.1.0")
 
+from signup_routes import router as signup_router
+app.include_router(signup_router)
+
+
 # --- CORS ---
 def _origins():
     raw = os.getenv("ALLOWED_ORIGINS")
