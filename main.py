@@ -18,6 +18,9 @@ from auth import (
     get_current_user,
 )
 
+from contact_routes import router as contact_router
+app.include_router(contact_router)
+
 # Routers
 from routes_public_config import router as public_cfg_router  # <-- NEW import for pricing
 
