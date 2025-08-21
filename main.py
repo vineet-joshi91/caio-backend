@@ -1,30 +1,48 @@
-# main.py
+# main.py  (TOP OF FILE → paste this block over your current header)
 import os
 import logging
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
+from datetime import datetime
+from typing import Optional
+
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Request
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import OAuth2PasswordRequestForm
+from sqlalchemy.orm import Session
 
-logging.basicConfig(level=logging.INFO)
+from db import get_db, User
+from auth import (
+    create_access_token,
+    verify_password,
+    get_password_hash,
+    get_current_user,
+)
+
+# --- create app FIRST ---
 logger = logging.getLogger("caio")
+logging.basicConfig(level=logging.INFO)
 
-# --- FastAPI app FIRST ---
 app = FastAPI(title="CAIO Backend", version="0.1.0")
 
+from signup_routes import router as signup_router
+app.include_router(signup_router)
+
+
 # --- CORS ---
-DEFAULT_ORIGINS = [
-    "https://caio-frontend.vercel.app",
-    "https://caioai.netlify.app",
-    "http://localhost:3000",
-    "http://127.0.0.1:3000",
-]
-extra = os.getenv("ALLOWED_ORIGINS", "")
-if extra:
-    DEFAULT_ORIGINS += [o.strip() for o in extra.split(",") if o.strip()]
+def _origins():
+    raw = os.getenv("ALLOWED_ORIGINS")
+    if raw:
+        return [o.strip() for o in raw.split(",") if o.strip()]
+    return [
+        "https://caio-frontend.vercel.app",
+        "https://caioai.netlify.app",
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=DEFAULT_ORIGINS,
+    allow_origins=_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -34,47 +52,30 @@ app.add_middleware(
 
 @app.options("/{path:path}")
 def cors_preflight(path: str):
-    # Helpful for quick CORS diagnostics from the browser
     return JSONResponse({"ok": True})
 
+# --- health ---
 @app.get("/api/health")
 def health():
     return {"status": "ok", "version": "0.1.0"}
 
-# --- Routers (import AFTER app exists) ---
-# Public config (pricing/flags)
-try:
-    from routes_public_config import router as public_cfg_router
-    app.include_router(public_cfg_router, tags=["public"])
-    logger.info("Loaded routes_public_config")
-except Exception as e:
-    logger.warning(f"routes_public_config not loaded: {e}")
+# --- import routers AFTER app exists ---
+from routes_public_config import router as public_cfg_router
+app.include_router(public_cfg_router, tags=["public"])
 
-# Signup route (new/updated)
-try:
-    from signup_routes import router as signup_router
-    app.include_router(signup_router)
-    logger.info("Loaded /api/signup")
-except Exception as e:
-    logger.warning(f"signup_routes not loaded: {e}")
-
-# Payments
+# optional routers; keep these guards if some files aren’t deployed yet
 try:
     from payment_routes import router as payments_router
-    # payment_routes already sets its own prefix or not; be explicit if needed:
-    app.include_router(payments_router, prefix="/api/payments")
-    logger.info("Loaded /api/payments/*")
+    app.include_router(payments_router, prefix="/api/payments", tags=["payments"])
+    logger.info("Payments router loaded at /api/payments")
 except Exception as e:
-    logger.warning(f"payment_routes not loaded: {e}")
+    logger.warning(f"Payments router NOT loaded: {e}")
 
-# Contact form (optional)
 try:
     from contact_routes import router as contact_router
-    app.include_router(contact_router)
-    logger.info("Loaded /api/contact")
+    app.include_router(contact_router)  # exposes POST /api/contact
+    logger.info("Contact router loaded at /api/contact")
 except Exception as e:
-    logger.warning(f"contact_routes not loaded: {e}")
+    logger.warning(f"Contact router NOT loaded: {e}")
 
-# --- Keep the rest of your existing endpoints below ---
-# e.g. /api/login, /api/profile, file upload, analysis, etc.
-# (No changes needed; they’ll continue to work.)
+# --- the rest of your file continues (login/profile/analyze endpoints, etc.) ---
