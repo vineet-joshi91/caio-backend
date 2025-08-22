@@ -146,6 +146,12 @@ try:
 except Exception as e:
     logger.warning(f"admin_bootstrap not loaded: {e}")
 
+try:
+    from maintenance_routes import router as maintenance_router
+    app.include_router(maintenance_router)
+except Exception as e:
+    logger.warning(f"maintenance_routes not loaded: {e}")
+
 # -----------------------------------------------------------------------------
 # (Keep any other existing endpoints below; no changes needed)
 # -----------------------------------------------------------------------------
