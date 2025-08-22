@@ -140,6 +140,12 @@ try:
 except Exception as e:
     logger.warning(f"contact_routes not loaded: {e}")
 
+try:
+    from admin_bootstrap import router as admin_bootstrap_router
+    app.include_router(admin_bootstrap_router)
+except Exception as e:
+    logger.warning(f"admin_bootstrap not loaded: {e}")
+
 # -----------------------------------------------------------------------------
 # (Keep any other existing endpoints below; no changes needed)
 # -----------------------------------------------------------------------------
