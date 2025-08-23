@@ -18,6 +18,8 @@ from auth import (
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("caio")
 
+from admin_metrics_routes import router as admin_metrics_router
+
 # -----------------------------------------------------------------------------
 # App FIRST
 # -----------------------------------------------------------------------------
@@ -45,6 +47,8 @@ app.add_middleware(
     expose_headers=["*"],
     max_age=86400,
 )
+
+app.include_router(admin_metrics_router)
 
 @app.options("/{path:path}")
 def cors_preflight(path: str):
