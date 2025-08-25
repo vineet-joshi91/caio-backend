@@ -51,10 +51,53 @@ app.add_middleware(
 
 app.include_router(admin_metrics_router)
 
-@app.options("/{path:path}")
-def cors_preflight(path: str):
-    # Helps browsers pass preflight even if a specific route isn’t defined
-    return JSONResponse({"ok": True})
+# --- in main.py ---
+from fastapi import Body
+
+@app.post("/api/login")
+def login(
+    request: Request,
+    form: OAuth2PasswordRequestForm = Depends(),
+    db: Session = Depends(get_db),
+):
+    # Primary path: form-encoded (works today)
+    email = form.username.strip().lower()
+    password = form.password
+    return _do_login(email, password, db)
+
+# Optional JSON fallback that the browser can use if someone posts JSON
+@app.post("/api/login.json")  # keep /api/login as primary; this is a fallback
+def login_json(payload: dict = Body(...), db: Session = Depends(get_db)):
+    email = (payload.get("username") or payload.get("email") or "").strip().lower()
+    password = payload.get("password") or ""
+    if not email or not password:
+        raise HTTPException(status_code=422, detail="username/email and password required")
+    return _do_login(email, password, db)
+
+def _do_login(email: str, password: str, db: Session):
+    user = db.query(User).filter(User.email == email).first()
+    if user:
+        if not verify_password(password, user.hashed_password):
+            raise HTTPException(status_code=400, detail="Incorrect email or password")
+    else:
+        # Create-on-first-login flow; keep hashing fast enough for Render free CPUs
+        user = User(
+            email=email,
+            hashed_password=get_password_hash(password),  # use bcrypt rounds ≤ 12
+            is_admin=(email in ADMIN_EMAILS),
+            is_paid=False,
+            created_at=datetime.utcnow(),
+        )
+        db.add(user); db.commit(); db.refresh(user)
+
+    token = create_access_token(sub=user.email)
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "email": user.email,
+        "is_admin": bool(user.is_admin),
+        "is_paid": bool(user.is_paid),
+    }
 
 # -----------------------------------------------------------------------------
 # Health
