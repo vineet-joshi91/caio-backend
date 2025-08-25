@@ -134,7 +134,7 @@ except Exception as e:
 
 try:
     from payment_routes import router as payments_router
-    # your payment_routes has no prefix → mount under /api/payments here
+    # payment_routes has no prefix → mount under /api/payments here
     app.include_router(payments_router)
     logger.info("Loaded /api/payments/*")
 except Exception as e:
