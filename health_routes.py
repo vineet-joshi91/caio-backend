@@ -14,16 +14,13 @@ from db import get_db
 router = APIRouter(prefix="/api")
 
 @router.get("/health")
-def health():
-    # super fast: proves the app is mounted
+def health():  # app is up
     return {"ok": True}
 
 @router.get("/ready")
-def ready(db: Session = Depends(get_db)):
-    # warms DB pool; returns fast after first cold start
+def ready(db: Session = Depends(get_db)):  # app + DB are up
     try:
         db.execute(text("SELECT 1"))
         return {"ok": True, "db": "up"}
-    except Exception as e:
-        # don’t expose internal traces
+    except Exception:
         return {"ok": False, "db": "down"}
