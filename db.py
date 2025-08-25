@@ -17,7 +17,13 @@ POSTGRES_URL = os.environ.get(
     "postgresql://caio_db_prod_yhi3_user:4uHW7iQgNPKoRXWYZtlvOU99I7Sr2M7H@dpg-d28u383uibrs73dvkc4g-a/caio_db_prod_yhi3",
 )
 
-engine = create_engine(POSTGRES_URL, future=True)
+# engine = create_engine(POSTGRES_URL)
+engine = create_engine(
+    POSTGRES_URL,
+    pool_pre_ping=True,       # tests connections before use
+    pool_recycle=280,         # refresh idle conns periodically
+)
+
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine, future=True)
 Base = declarative_base()
 

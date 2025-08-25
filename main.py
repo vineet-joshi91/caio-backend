@@ -6,6 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
+from health_routes import router as health_router
 
 from db import get_db, User
 from auth import (
@@ -61,6 +62,8 @@ def cors_preflight(path: str):
 @app.get("/api/health")
 def health():
     return {"status": "ok", "version": "0.1.0"}
+
+app.include_router(health_router)
 
 # -----------------------------------------------------------------------------
 # Auth: /api/login and /api/profile
