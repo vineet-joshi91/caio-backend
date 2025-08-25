@@ -9,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
 
-from db import get_db, User
+from db import get_db, User, init_db
 from auth import create_access_token, verify_password, get_password_hash, get_current_user
 
 logging.basicConfig(level=logging.INFO)
@@ -18,6 +18,8 @@ logger = logging.getLogger("caio")
 DEBUG = os.getenv("DEBUG", "0") in ("1", "true", "TRUE", "yes", "YES")
 
 app = FastAPI(title="CAIO Backend", version="0.1.0")
+
+init_db()
 
 # ---- CORS ----
 ALLOWED_ORIGINS = [

@@ -1,84 +1,46 @@
 # db.py
-# -*- coding: utf-8 -*-
-"""
-Created on Wed Jul 30 17:57:01 2025
-@author: Vineet
-"""
-
 import os
-from datetime import datetime
-from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, text
-from sqlalchemy.orm import declarative_base, sessionmaker
+from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime
+from sqlalchemy.orm import sessionmaker, declarative_base, scoped_session
 
-# --- CONFIG ---
+def _normalize_db_url(url: str) -> str:
+    # Render sometimes provides postgres:// – SQLAlchemy needs postgresql://
+    if url and url.startswith("postgres://"):
+        return url.replace("postgres://", "postgresql://", 1)
+    return url
 
-POSTGRES_URL = os.environ.get(
-    "DATABASE_URL",
-    "postgresql://caio_db_prod_yhi3_user:4uHW7iQgNPKoRXWYZtlvOU99I7Sr2M7H@dpg-d28u383uibrs73dvkc4g-a/caio_db_prod_yhi3",
-)
+DATABASE_URL = _normalize_db_url(os.getenv("DATABASE_URL", "")) or "sqlite:///./caio.db"
 
-# engine = create_engine(POSTGRES_URL)
+# SQLite needs this connect arg; Postgres should not have it.
+connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
+
 engine = create_engine(
-    POSTGRES_URL,
-    pool_pre_ping=True,       # tests connections before use
-    pool_recycle=280,         # refresh idle conns periodically
+    DATABASE_URL,
+    pool_pre_ping=True,            # auto-reconnect
+    connect_args=connect_args,
 )
 
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine, future=True)
+SessionLocal = scoped_session(sessionmaker(bind=engine, autocommit=False, autoflush=False))
 Base = declarative_base()
 
-# --- MODELS ---
-
+# ---- Models (keep minimal but complete for login) ----
 class User(Base):
     __tablename__ = "users"
-
     id = Column(Integer, primary_key=True, index=True)
-    email = Column(String, unique=True, index=True, nullable=False)
-    hashed_password = Column(String, nullable=False)
+    email = Column(String(320), unique=True, nullable=False, index=True)
+    hashed_password = Column(String(255), nullable=True)
+    is_admin = Column(Boolean, default=False, nullable=False)
+    is_paid = Column(Boolean, default=False, nullable=False)
+    created_at = Column(DateTime, nullable=True)
 
-    is_admin = Column(Boolean, nullable=False, server_default=text("false"))
-    is_active = Column(Boolean, nullable=False, server_default=text("true"))
-    is_paid  = Column(Boolean, nullable=False, server_default=text("false"))
-
-    stripe_customer_id = Column(String, nullable=True)
-
-    # NEW — Razorpay Subscriptions tracking
-    subscription_id = Column(String, nullable=True)   # e.g., "sub_********"
-    plan_status     = Column(String, nullable=True)   # "active" | "created" | "cancelled" | etc.
-
-    created_at = Column(DateTime, nullable=False, server_default=text("CURRENT_TIMESTAMP"))
-    updated_at = Column(DateTime, nullable=False, server_default=text("CURRENT_TIMESTAMP"))
-
-class UsageLog(Base):
-    __tablename__ = "usage_logs"
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, nullable=False)
-    timestamp = Column(DateTime, default=datetime.utcnow)
-    tokens_used = Column(Integer, default=0)
-    endpoint = Column(String, default="")
-    status = Column(String, default="success")
-
-# --- OPTIONAL: capture subscription cancellation reasons ---
-
-class CancellationReason(Base):
-    __tablename__ = "cancellation_reasons"
-
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, nullable=False)                 # users.id
-    subscription_id = Column(String, nullable=False)          # your User.subscription_id (or local sub id)
-    category = Column(String, nullable=False)                 # e.g. 'price', 'value', 'missing_feature', ...
-    detail = Column(String, nullable=True)                    # free text
-    created_at = Column(DateTime, default=datetime.utcnow)
-
-# --- DB INIT/HELPERS ---
-
-def init_db():
-    """Create missing tables (does not add new columns to existing tables)."""
-    Base.metadata.create_all(bind=engine)
-
+# ---- Session dependency ----
 def get_db():
     db = SessionLocal()
     try:
         yield db
     finally:
         db.close()
+
+# ---- Init helper ----
+def init_db():
+    Base.metadata.create_all(bind=engine)
