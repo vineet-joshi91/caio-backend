@@ -1,243 +1,124 @@
 # payment_routes.py
-from __future__ import annotations
-
-import os, hmac, hashlib, json
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, Header
+from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
-from sqlalchemy import text
-from pydantic import BaseModel
-import httpx
+import os, razorpay, httpx, hmac, hashlib, json, logging
 
-from db import get_db, User  # User must have: subscription_id, plan_status, is_paid (and optionally billing_currency, CancellationReason)
+from db import get_db, User
 from auth import get_current_user
 
+logger = logging.getLogger("payments")
+
+# NOTE: prefix lives here; DO NOT add another prefix when including in main.py
 router = APIRouter(prefix="/api/payments", tags=["payments"])
 
-RAZORPAY_KEY_ID         = os.getenv("RAZORPAY_KEY_ID", "")
-RAZORPAY_KEY_SECRET     = os.getenv("RAZORPAY_KEY_SECRET", "") or os.getenv("RAZORPAY_SECRET", "")
-RAZORPAY_WEBHOOK_SECRET = os.getenv("RAZORPAY_WEBHOOK_SECRET", "")
-BACKEND_BASE            = os.getenv("BACKEND_BASE", "https://caio-backend.onrender.com")
+RAZORPAY_KEY_ID = os.getenv("RAZORPAY_KEY_ID")
+RAZORPAY_SECRET = os.getenv("RAZORPAY_SECRET")
+WEBHOOK_SECRET  = os.getenv("RAZORPAY_WEBHOOK_SECRET")
+PUBLIC_CONFIG_URL = os.getenv("PUBLIC_CONFIG_URL", "https://caio-backend.onrender.com/api/public-config")
 
+_rz_client = None
+def get_client() -> razorpay.Client:
+    global _rz_client
+    if _rz_client:
+        return _rz_client
+    if not (RAZORPAY_KEY_ID and RAZORPAY_SECRET):
+        raise HTTPException(status_code=500, detail="Payments not configured (missing Razorpay keys).")
+    _rz_client = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_SECRET))
+    return _rz_client
 
-def _require_keys():
-    if not (RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET):
-        raise HTTPException(500, "Razorpay keys not configured")
-
-
-@router.get("/subscription-config")
-async def subscription_config():
-    """
-    Public info for the Pro subscription (currency, amount, key_id, mode).
-    Frontend uses this to display price/mode.
-    """
-    async with httpx.AsyncClient(timeout=8.0) as c:
-        r = await c.get(f"{BACKEND_BASE}/api/public-config")
-    cfg = r.json() if r.is_success else {}
+async def get_region_pricing(req: Request) -> tuple[str, int]:
+    """Returns (currency, amount_in_minor_units)."""
+    force = req.query_params.get("force")
+    params = {"force": force} if force else {}
+    async with httpx.AsyncClient(timeout=8.0) as x:
+        r = await x.get(PUBLIC_CONFIG_URL, params=params)
+        r.raise_for_status()
+        cfg = r.json()
     currency = (cfg.get("currency") or "INR").upper()
-    pro = (cfg.get("plans") or {}).get("pro") or {"price": 1999, "period": "month"}
-    return {
-        "key_id": RAZORPAY_KEY_ID,
-        "currency": currency,
-        "amount_major": int(pro["price"]),
-        "interval": pro.get("period", "month"),
-        "mode": "test" if RAZORPAY_KEY_ID.startswith("rzp_test_") else "live",
-        "engine": "subscription",
-    }
+    pro = (cfg.get("plans") or {}).get("pro") or {}
+    price_major = int(pro.get("price", 1999))
+    amount_minor = price_major * 100   # paise / cents
+    return currency, amount_minor
 
+@router.get("/config")
+async def payments_config(request: Request):
+    try:
+        currency, _ = await get_region_pricing(request)
+        return {"key_id": RAZORPAY_KEY_ID, "currency": currency}
+    except Exception as e:
+        logger.exception("payments_config error")
+        raise HTTPException(status_code=500, detail=f"Payments config error: {e}")
 
-@router.post("/subscribe")
-async def subscribe(
+@router.post("/create-order")
+async def create_order(
+    request: Request,
+    current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
 ):
-    """
-    Create a Razorpay Subscription for the current user.
-    - Ensures a matching Plan exists (amount/currency/interval).
-    - Creates subscription (open-ended).
-    - Stores subscription_id + status on the user.
-    - Stores user's billing currency if the column exists.
-    Auto-debits are handled by Razorpay after mandate authentication.
-    """
-    _require_keys()
-
-    # 1) Price & interval from public-config
-    async with httpx.AsyncClient(timeout=10.0) as c:
-        r = await c.get(f"{BACKEND_BASE}/api/public-config")
-    if not r.is_success:
-        raise HTTPException(500, "Could not fetch pricing config")
-
-    cfg = r.json()
-    currency = (cfg.get("currency") or "INR").upper()
-    amount_major = int((cfg.get("plans") or {}).get("pro", {}).get("price", 1999))
-    interval = (cfg.get("plans") or {}).get("pro", {}).get("period", "month")
-
-    auth = (RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET)
-
-    # 2) Ensure a Plan exists that matches price/currency/interval
-    async with httpx.AsyncClient(timeout=15.0, auth=auth) as c:
-        plans = await c.get(
-            "https://api.razorpay.com/v1/plans",
-            params={
-                "item[name]": "CAIO Pro",
-                "period": interval,
-                "item[amount]": amount_major * 100,
-                "item[currency]": currency,
-            },
-        )
-        plan_id = None
-        if plans.is_success and plans.json().get("items"):
-            plan_id = plans.json()["items"][0]["id"]
-        if not plan_id:
-            pr = await c.post("https://api.razorpay.com/v1/plans", json={
-                "period": interval,
-                "interval": 1,
-                "item": {
-                    "name": "CAIO Pro",
-                    "amount": amount_major * 100,
-                    "currency": currency,
-                    "description": "Monthly subscription for CAIO Pro"
-                }
-            })
-            if pr.status_code >= 400:
-                raise HTTPException(pr.status_code, pr.text)
-            plan_id = pr.json()["id"]
-
-        # 3) Create the Subscription (open‑ended: total_count=0)
-        sr = await c.post("https://api.razorpay.com/v1/subscriptions", json={
-            "plan_id": plan_id,
-            "customer_notify": 1,  # Razorpay can send auth link if needed
-            "total_count": 0,
-            "notes": {"email": user.email},
-        })
-        if sr.status_code >= 400:
-            raise HTTPException(sr.status_code, sr.text)
-        sub = sr.json()
-
-    # 4) Persist on user
-    user.subscription_id = sub["id"]
-    user.plan_status = sub.get("status", "created")
-    # If you added users.billing_currency, store it for admin metrics
-    if hasattr(user, "billing_currency"):
-        try:
-            setattr(user, "billing_currency", currency)
-        except Exception:
-            pass
-    db.add(user)
-    db.commit()
-
-    return {
-        "subscription_id": sub["id"],
-        "status": user.plan_status,
-        "key_id": RAZORPAY_KEY_ID
-    }
-
-
-class CancelIn(BaseModel):
-    reason_category: str | None = None
-    reason_detail: str | None = None
-
-
-@router.post("/cancel")
-async def cancel_subscription(
-    payload: CancelIn,
-    db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
-):
-    """
-    Cancel the active subscription immediately and record a (optional) reason.
-    - Stores {reason_category, reason_detail} if provided.
-    - Calls Razorpay cancel with cancel_at_cycle_end=0 (immediate).
-    - Flips user to is_paid=False right away.
-    """
-    _require_keys()
-    if not user.subscription_id:
-        raise HTTPException(400, "No active subscription")
-
-    # 1) Record reason (if provided). Use ORM model if present; else raw SQL.
-    cat = (payload.reason_category or "").strip().lower()
-    det = (payload.reason_detail or "").strip()
-    if cat:
-        try:
-            # Try ORM model first
-            CancellationReason = globals().get("CancellationReason", None)
-            if CancellationReason is not None:
-                db.add(CancellationReason(
-                    user_id=user.id,
-                    subscription_id=user.subscription_id,
-                    category=cat,
-                    detail=(det[:1000] if det else None),
-                ))
-                db.commit()
-            else:
-                # Fallback raw SQL insert (works even if you didn't add the ORM model)
-                db.execute(text(
-                    "INSERT INTO cancellation_reasons (user_id, subscription_id, category, detail) "
-                    "VALUES (:uid, :sid, :cat, :det)"
-                ), {"uid": user.id, "sid": user.subscription_id, "cat": cat, "det": (det[:1000] if det else None)})
-                db.commit()
-        except Exception:
-            db.rollback()  # never block cancellation on feedback failure
-
-    # 2) Cancel immediately at Razorpay
-    auth = (RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET)
-    async with httpx.AsyncClient(timeout=15.0, auth=auth) as c:
-        r = await c.post(
-            f"https://api.razorpay.com/v1/subscriptions/{user.subscription_id}/cancel",
-            json={"cancel_at_cycle_end": 0},  # immediate
-        )
-        if r.status_code >= 400:
-            raise HTTPException(r.status_code, r.text)
-
-    # 3) Flip local flags right away
-    user.plan_status = "cancelled"
-    user.is_paid = False
-    db.add(user)
-    db.commit()
-
-    return {"ok": True, "status": "cancelled"}
-
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    try:
+        currency, amount_minor = await get_region_pricing(request)
+        client = get_client()
+        order = client.order.create(dict(
+            amount=amount_minor,
+            currency=currency,
+            receipt=f"pro-{current_user.email}",
+            payment_capture=1,
+            notes={"email": current_user.email, "plan": "pro"},
+        ))
+        return {
+            "order_id": order["id"],
+            "amount": order["amount"],
+            "currency": order["currency"],
+            "key_id": RAZORPAY_KEY_ID,
+        }
+    except razorpay.errors.BadRequestError as e:
+        logger.exception("Razorpay bad request")
+        raise HTTPException(status_code=400, detail=f"Razorpay error: {e}")
+    except Exception as e:
+        logger.exception("Create order error")
+        raise HTTPException(status_code=500, detail=f"Create order failed: {e}")
 
 @router.post("/webhook")
-async def webhook(request: Request, db: Session = Depends(get_db)):
-    """
-    Razorpay webhook: keeps user.is_paid and plan_status in sync.
-    Minimal handling for now (activated/charged/cancelled/paused/halted).
-    You can extend this to store invoices if needed.
-    """
-    if not RAZORPAY_WEBHOOK_SECRET:
-        # Allow running without a secret in early dev
-        return {"ok": True, "skipped": "no webhook secret set"}
+async def webhook(
+    request: Request,
+    x_razorpay_signature: str = Header(None),
+    db: Session = Depends(get_db),
+):
+    if not WEBHOOK_SECRET:
+        raise HTTPException(status_code=500, detail="Webhook secret not configured")
+    try:
+        body_bytes = await request.body()
+        payload = body_bytes.decode("utf-8")
 
-    raw = await request.body()
-    given = request.headers.get("x-razorpay-signature") or ""
-    expect = hmac.new(RAZORPAY_WEBHOOK_SECRET.encode(), raw, hashlib.sha256).hexdigest()
-    if not hmac.compare_digest(expect, given):
-        raise HTTPException(400, "Invalid signature")
+        # HMAC SHA256 verification
+        digest = hmac.new(WEBHOOK_SECRET.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(digest, (x_razorpay_signature or "")):
+            return JSONResponse({"status": "invalid-signature"}, status_code=400)
 
-    evt = json.loads(raw.decode("utf-8"))
-    etype = evt.get("event", "")
-    payload = evt.get("payload", {})
+        event = json.loads(payload)
+        etype = event.get("event", "")
+        pay_entity = (event.get("payload", {}).get("payment", {}) or {}).get("entity", {})
+        order_entity = (event.get("payload", {}).get("order", {}) or {}).get("entity", {})
+        email = (pay_entity.get("notes") or {}).get("email") or (order_entity.get("notes") or {}).get("email")
 
-    def _user_from_sub() -> User | None:
-        sub_id = (payload.get("subscription") or {}).get("entity", {}).get("id")
-        if not sub_id:
-            return None
-        return db.query(User).filter(User.subscription_id == sub_id).first()
+        if etype == "payment.captured" and email:
+            user = db.query(User).filter(User.email == email).first()
+            if user:
+                user.is_paid = True
+                db.add(user); db.commit()
+                return {"status": "ok", "updated": True}
+            return {"status": "ok", "updated": False, "reason": "user-not-found"}
 
-    if etype in ("subscription.activated", "subscription.charged"):
-        u = _user_from_sub()
-        if u:
-            u.plan_status = "active"
-            u.is_paid = True
-            db.add(u); db.commit()
+        return {"status": "ignored", "event": etype}
+    except Exception as e:
+        logging.exception("Webhook processing error")
+        return JSONResponse({"status": "error", "detail": str(e)}, status_code=500)
 
-    elif etype in ("subscription.paused", "subscription.halted", "subscription.cancelled"):
-        u = _user_from_sub()
-        if u:
-            u.plan_status = "cancelled"
-            u.is_paid = False
-            db.add(u); db.commit()
-
-    # You can also handle invoice.paid / payment.failed here later for analytics
-
-    return {"ok": True}
+@router.get("/status")
+async def status(current_user: User = Depends(get_current_user)):
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    return {"email": current_user.email, "is_paid": bool(current_user.is_paid)}
