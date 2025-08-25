@@ -1,37 +1,26 @@
-# main.py
-import os
-import logging
+# main.py (diagnostic hotfix)
+import os, logging, traceback
 from typing import Optional
 from datetime import datetime
 
-from fastapi import (
-    FastAPI, Depends, HTTPException, UploadFile, File, Form, Request
-)
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
 
 from db import get_db, User
-from auth import (
-    create_access_token,
-    verify_password,
-    get_password_hash,
-    get_current_user,
-)
+from auth import create_access_token, verify_password, get_password_hash, get_current_user
 
-# ---------------------------------------------------------------------
-# App & logging
-# ---------------------------------------------------------------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("caio")
 
+DEBUG = os.getenv("DEBUG", "0") in ("1", "true", "TRUE", "yes", "YES")
+
 app = FastAPI(title="CAIO Backend", version="0.1.0")
 
-# ---------------------------------------------------------------------
-# CORS (Netlify + Vercel + local dev)
-# ---------------------------------------------------------------------
-ALLOWED_ORIGINS_DEFAULT = [
+# ---- CORS ----
+ALLOWED_ORIGINS = [
     "https://caio-frontend.vercel.app",
     "https://caioai.netlify.app",
     "http://localhost:3000",
@@ -39,11 +28,11 @@ ALLOWED_ORIGINS_DEFAULT = [
 ]
 extra = os.getenv("ALLOWED_ORIGINS", "")
 if extra:
-    ALLOWED_ORIGINS_DEFAULT += [o.strip() for o in extra.split(",") if o.strip()]
+    ALLOWED_ORIGINS += [o.strip() for o in extra.split(",") if o.strip()]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS_DEFAULT,
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -51,14 +40,11 @@ app.add_middleware(
     max_age=86400,
 )
 
-# Let browsers succeed on preflight even if a specific method/path isn't declared.
 @app.options("/{path:path}")
 def cors_preflight(path: str):
     return JSONResponse({"ok": True})
 
-# ---------------------------------------------------------------------
-# Health/Ready
-# ---------------------------------------------------------------------
+# ---- Health ----
 @app.get("/api/health")
 def health():
     return {"status": "ok", "version": "0.1.0"}
@@ -67,46 +53,35 @@ def health():
 def ready():
     return {"ready": True, "time": datetime.utcnow().isoformat() + "Z"}
 
-# ---------------------------------------------------------------------
-# Auth: /api/login and /api/profile
-# ---------------------------------------------------------------------
+# ---- Auth ----
 ADMIN_EMAILS = {
     e.strip().lower()
     for e in os.getenv("ADMIN_EMAILS", "vineetpjoshi.71@gmail.com").split(",")
     if e.strip()
 }
 
-@app.post("/api/login")
-def login(
-    form: OAuth2PasswordRequestForm = Depends(),
-    db: Session = Depends(get_db),
-):
-    """
-    Password login. If user doesn't exist yet, create them (create-or-login behavior).
-    Frontend posts 'username' (email) and 'password' as x-www-form-urlencoded.
-    """
-    email = (form.username or "").strip().lower()
-    password = form.password or ""
-
+def _login_core(email: str, password: str, db: Session):
     if not email or not password:
         raise HTTPException(status_code=400, detail="Email and password required")
 
     user = db.query(User).filter(User.email == email).first()
     if user:
+        # Ensure the attribute exists; if not, the DB schema is wrong
+        if not hasattr(user, "hashed_password"):
+            raise RuntimeError("User model missing 'hashed_password' column")
         if not verify_password(password, user.hashed_password):
             raise HTTPException(status_code=400, detail="Incorrect email or password")
     else:
-        # Create on first login to keep current behavior
+        # Ensure hashing works; passlib/bcrypt issues will throw here
+        hpw = get_password_hash(password)
         user = User(
             email=email,
-            hashed_password=get_password_hash(password),
+            hashed_password=hpw if hasattr(User, "hashed_password") else None,
             is_admin=(email in ADMIN_EMAILS) if hasattr(User, "is_admin") else False,
             is_paid=False if hasattr(User, "is_paid") else False,
             created_at=datetime.utcnow() if hasattr(User, "created_at") else None,
         )
-        db.add(user)
-        db.commit()
-        db.refresh(user)
+        db.add(user); db.commit(); db.refresh(user)
 
     token = create_access_token(sub=user.email)
     return {
@@ -117,90 +92,97 @@ def login(
         "is_paid": bool(getattr(user, "is_paid", False)),
     }
 
+@app.post("/api/login")
+def login(form: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+    try:
+        email = (form.username or "").strip().lower()
+        password = form.password or ""
+        return _login_core(email, password, db)
+    except HTTPException:
+        raise
+    except Exception as e:
+        # Log full traceback for Render logs
+        logger.error("Login failed: %s\n%s", e, traceback.format_exc())
+        if DEBUG:
+            return JSONResponse(
+                {"detail": f"login-500: {e.__class__.__name__}: {e}"},
+                status_code=500,
+            )
+        raise HTTPException(status_code=500, detail="Login failed")
+
 @app.get("/api/profile")
 def profile(current_user: User = Depends(get_current_user)):
-    """
-    Basic profile for the frontend to check auth state.
-    """
-    data = {
+    return {
         "email": current_user.email,
         "is_admin": bool(getattr(current_user, "is_admin", False)),
         "is_paid": bool(getattr(current_user, "is_paid", False)),
+        "created_at": getattr(current_user, "created_at", None),
     }
-    for k in ("name", "organisation", "company", "created_at"):
-        if hasattr(current_user, k):
-            data[k] = getattr(current_user, k)
-    return data
 
-# ---------------------------------------------------------------------
-# Demo Analyze stub (kept as-is; adjust when engines are wired)
-# ---------------------------------------------------------------------
-@app.post("/api/analyze")
-async def analyze(
-    request: Request,
-    file: Optional[UploadFile] = File(None),
-    text: Optional[str] = Form(None),
-    current_user: User = Depends(get_current_user),
-):
-    text = (text or "").strip()
+# ---- Debug helpers (safe to keep; only metadata) ----
+@app.get("/api/debug/ping-db")
+def ping_db(db: Session = Depends(get_db)):
+    try:
+        # very light query
+        count = db.query(User).count()
+        # also inspect first row columns that matter
+        u = db.query(User).first()
+        fields = []
+        if u:
+            for k in ("email", "hashed_password", "is_admin", "is_paid", "created_at"):
+                fields.append(f"{k}={'Y' if hasattr(u, k) else 'N'}")
+        return {"ok": True, "user_count": count, "user_fields": ", ".join(fields)}
+    except Exception as e:
+        logger.error("DB ping error: %s\n%s", e, traceback.format_exc())
+        if DEBUG:
+            return JSONResponse({"ok": False, "detail": str(e)}, status_code=500)
+        raise HTTPException(status_code=500, detail="DB error")
 
-    if not getattr(current_user, "is_paid", False):
-        return JSONResponse(
-            {
-                "status": "demo",
-                "title": "Demo Mode Result",
-                "summary": "This is a sample analysis. Upgrade to Pro for full insights.",
-                "tip": "Upload a business document or upgrade your plan to unlock advanced engines.",
-            },
-            status_code=200,
-        )
+@app.get("/api/debug/user-sample")
+def user_sample(db: Session = Depends(get_db)):
+    try:
+        u = db.query(User).first()
+        if not u:
+            return {"sample": None}
+        return {
+            "email": getattr(u, "email", None),
+            "has_hashed_password": hasattr(u, "hashed_password"),
+            "is_admin": getattr(u, "is_admin", None),
+            "is_paid": getattr(u, "is_paid", None),
+        }
+    except Exception as e:
+        logger.error("User sample error: %s\n%s", e, traceback.format_exc())
+        if DEBUG:
+            return JSONResponse({"detail": str(e)}, status_code=500)
+        raise HTTPException(status_code=500, detail="DB error")
 
-    # Placeholder until Pro engines/credits are wired
-    return JSONResponse(
-        {
-            "status": "error",
-            "title": "Analysis Unavailable",
-            "message": "You’ve run out of credits or the AI engine is unavailable right now.",
-            "action": "Please add credits or try again later.",
-        },
-        status_code=402,
-    )
-
-# ---------------------------------------------------------------------
-# Routers (mounted safely so import errors never break boot)
-# ---------------------------------------------------------------------
+# ---- Routers (don’t crash boot if optional modules are absent) ----
 try:
     from routes_public_config import router as public_cfg_router
-    app.include_router(public_cfg_router)  # exposes /api/public-config
-    logger.info("Loaded routes_public_config")
+    app.include_router(public_cfg_router)  # /api/public-config
 except Exception as e:
     logger.warning(f"routes_public_config not loaded: {e}")
 
 try:
     from payment_routes import router as payments_router
-    # payment_routes already uses prefix="/api/payments" internally; don't add one here.
-    app.include_router(payments_router)
-    logger.info("Loaded /api/payments/*")
+    app.include_router(payments_router)  # already prefixed with /api/payments
 except Exception as e:
     logger.warning(f"payment_routes not loaded: {e}")
 
 try:
     from contact_routes import router as contact_router
     app.include_router(contact_router)  # /api/contact
-    logger.info("Loaded /api/contact")
 except Exception as e:
     logger.warning(f"contact_routes not loaded: {e}")
 
 try:
     from admin_bootstrap import router as admin_bootstrap_router
-    app.include_router(admin_bootstrap_router)  # /api/admin_bootstrap/grant
-    logger.info("Loaded /api/admin_bootstrap")
+    app.include_router(admin_bootstrap_router)
 except Exception as e:
     logger.warning(f"admin_bootstrap not loaded: {e}")
 
 try:
     from maintenance_routes import router as maintenance_router
-    app.include_router(maintenance_router)  # /api/admin/maintenance/upgrade-db
-    logger.info("Loaded /api/admin/maintenance")
+    app.include_router(maintenance_router)
 except Exception as e:
     logger.warning(f"maintenance_routes not loaded: {e}")
