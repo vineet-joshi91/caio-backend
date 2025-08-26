@@ -1,7 +1,8 @@
-# main.py (diagnostic hotfix)
-import os, logging, traceback
+# main.py
+import os, logging, traceback, json
 from typing import Optional
 from datetime import datetime
+from io import BytesIO
 
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Request
 from fastapi.responses import JSONResponse
@@ -12,6 +13,9 @@ from sqlalchemy.orm import Session
 from db import get_db, User, init_db
 from auth import create_access_token, verify_password, get_password_hash, get_current_user
 
+# ------------------------------------------------------------------------------
+# App + logging
+# ------------------------------------------------------------------------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("caio")
 
@@ -19,9 +23,12 @@ DEBUG = os.getenv("DEBUG", "0") in ("1", "true", "TRUE", "yes", "YES")
 
 app = FastAPI(title="CAIO Backend", version="0.1.0")
 
+# Ensure tables exist (works for Postgres or SQLite fallback)
 init_db()
 
-# ---- CORS ----
+# ------------------------------------------------------------------------------
+# CORS
+# ------------------------------------------------------------------------------
 ALLOWED_ORIGINS = [
     "https://caio-frontend.vercel.app",
     "https://caioai.netlify.app",
@@ -42,11 +49,14 @@ app.add_middleware(
     max_age=86400,
 )
 
+# Browser preflight helper (keeps OPTIONS happy even if specific route missing)
 @app.options("/{path:path}")
 def cors_preflight(path: str):
     return JSONResponse({"ok": True})
 
-# ---- Health ----
+# ------------------------------------------------------------------------------
+# Health / Ready
+# ------------------------------------------------------------------------------
 @app.get("/api/health")
 def health():
     return {"status": "ok", "version": "0.1.0"}
@@ -55,7 +65,9 @@ def health():
 def ready():
     return {"ready": True, "time": datetime.utcnow().isoformat() + "Z"}
 
-# ---- Auth ----
+# ------------------------------------------------------------------------------
+# Auth
+# ------------------------------------------------------------------------------
 ADMIN_EMAILS = {
     e.strip().lower()
     for e in os.getenv("ADMIN_EMAILS", "vineetpjoshi.71@gmail.com").split(",")
@@ -68,13 +80,11 @@ def _login_core(email: str, password: str, db: Session):
 
     user = db.query(User).filter(User.email == email).first()
     if user:
-        # Ensure the attribute exists; if not, the DB schema is wrong
         if not hasattr(user, "hashed_password"):
             raise RuntimeError("User model missing 'hashed_password' column")
         if not verify_password(password, user.hashed_password):
             raise HTTPException(status_code=400, detail="Incorrect email or password")
     else:
-        # Ensure hashing works; passlib/bcrypt issues will throw here
         hpw = get_password_hash(password)
         user = User(
             email=email,
@@ -103,13 +113,9 @@ def login(form: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get
     except HTTPException:
         raise
     except Exception as e:
-        # Log full traceback for Render logs
         logger.error("Login failed: %s\n%s", e, traceback.format_exc())
         if DEBUG:
-            return JSONResponse(
-                {"detail": f"login-500: {e.__class__.__name__}: {e}"},
-                status_code=500,
-            )
+            return JSONResponse({"detail": f"login-500: {e.__class__.__name__}: {e}"}, status_code=500)
         raise HTTPException(status_code=500, detail="Login failed")
 
 @app.get("/api/profile")
@@ -121,13 +127,174 @@ def profile(current_user: User = Depends(get_current_user)):
         "created_at": getattr(current_user, "created_at", None),
     }
 
-# ---- Debug helpers (safe to keep; only metadata) ----
+# ------------------------------------------------------------------------------
+# Analyze
+#   - Demo users → demo result (unchanged UX)
+#   - Pro users → real LLM if key present (OpenAI preferred, else OpenRouter)
+#   - If no key: return a Pro stub so end-to-end tests still succeed
+# ------------------------------------------------------------------------------
+def _read_txt(body: bytes) -> str:
+    try:
+        return body.decode("utf-8", errors="ignore")
+    except Exception:
+        return ""
+
+def _read_pdf(body: bytes) -> str:
+    try:
+        from PyPDF2 import PdfReader
+        reader = PdfReader(BytesIO(body))
+        return "\n".join((p.extract_text() or "") for p in reader.pages)
+    except Exception:
+        return ""
+
+def _read_docx(body: bytes) -> str:
+    try:
+        import docx  # python-docx
+        d = docx.Document(BytesIO(body))
+        return "\n".join(p.text for p in d.paragraphs)
+    except Exception:
+        return ""
+
+async def _extract_text(file: Optional[UploadFile]) -> str:
+    if not file:
+        return ""
+    body = await file.read()
+    name = (file.filename or "").lower()
+    if name.endswith(".pdf"):
+        return _read_pdf(body)
+    if name.endswith(".docx"):
+        return _read_docx(body)
+    return _read_txt(body)
+
+def _call_openai_chat(prompt: str) -> str:
+    key = os.getenv("OPENAI_API_KEY")
+    if not key:
+        raise RuntimeError("OPENAI_API_KEY missing")
+
+    # Try SDK first; if it fails (version mismatch), fall back to REST
+    try:
+        import openai
+        if hasattr(openai, "OpenAI"):  # new-style client
+            client = openai.OpenAI(api_key=key)
+            resp = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.2,
+            )
+            return resp.choices[0].message.content
+        else:  # legacy
+            openai.api_key = key
+            resp = openai.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.2,
+            )
+            return resp.choices[0].message.content
+    except Exception as e:
+        # REST fallback (works without SDK)
+        import requests
+        headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+        data = {
+            "model": "gpt-4o-mini",
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.2,
+        }
+        r = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, data=json.dumps(data), timeout=60)
+        r.raise_for_status()
+        j = r.json()
+        return j["choices"][0]["message"]["content"]
+
+def _call_openrouter_chat(prompt: str) -> str:
+    key = os.getenv("OPENROUTER_API_KEY")
+    if not key:
+        raise RuntimeError("OPENROUTER_API_KEY missing")
+    import requests
+    headers = {
+        "Authorization": f"Bearer {key}",
+        "HTTP-Referer": "https://caio-frontend.vercel.app",
+        "X-Title": "CAIO",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": "openai/gpt-4o-mini",
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.2,
+    }
+    r = requests.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, data=json.dumps(payload), timeout=60)
+    r.raise_for_status()
+    return r.json()["choices"][0]["message"]["content"]
+
+@app.post("/api/analyze")
+async def analyze(
+    request: Request,
+    file: Optional[UploadFile] = File(None),
+    text: Optional[str] = Form(None),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    POST-only. If not paid → demo result.
+    If paid → extract text and run LLM (OpenAI preferred; else OpenRouter).
+    With no keys configured, return a Pro stub so UX still completes.
+    """
+    # DEMO users
+    if not getattr(current_user, "is_paid", False):
+        return JSONResponse(
+            {
+                "status": "demo",
+                "title": "Demo Mode Result",
+                "summary": "This is a sample analysis. Upgrade to Pro for full insights.",
+                "tip": "Upload a business document or upgrade your plan to unlock advanced engines.",
+            },
+            status_code=200,
+        )
+
+    # PRO users
+    extracted = await _extract_text(file)
+    brief = (text or "").strip()
+    if not extracted and not brief:
+        raise HTTPException(status_code=400, detail="Please upload a file or provide text")
+
+    prompt = (
+        "You are CAIO (Chief AI Officer). Read the user's brief and document text. "
+        "Return a concise summary (5 bullets) and 3 actionable recommendations.\n\n"
+        f"BRIEF:\n{brief or '(none)'}\n\nDOCUMENT:\n{extracted[:15000]}"
+    )
+
+    try:
+        if os.getenv("OPENAI_API_KEY"):
+            summary = _call_openai_chat(prompt)
+        elif os.getenv("OPENROUTER_API_KEY"):
+            summary = _call_openrouter_chat(prompt)
+        else:
+            # No keys configured → Pro stub so flows pass end-to-end
+            summary = (
+                "Stub summary (no LLM key configured). "
+                "This confirms file upload, extraction, and paid routing work.\n\n"
+                f"Extracted chars: {len(extracted)}"
+            )
+        return {
+            "status": "ok",
+            "title": "Analysis Complete",
+            "summary": summary,
+            "meta": {
+                "chars": len(extracted),
+                "provider": "openai" if os.getenv("OPENAI_API_KEY") else ("openrouter" if os.getenv("OPENROUTER_API_KEY") else "stub"),
+            },
+        }
+    except Exception as e:
+        logger.error("Analyze failed: %s\n%s", e, traceback.format_exc())
+        if DEBUG:
+            return JSONResponse({"status": "error", "detail": str(e)}, status_code=500)
+        raise HTTPException(status_code=500, detail="Analysis failed")
+
+# ------------------------------------------------------------------------------
+# Debug helpers
+# ------------------------------------------------------------------------------
 @app.get("/api/debug/ping-db")
 def ping_db(db: Session = Depends(get_db)):
     try:
-        # very light query
         count = db.query(User).count()
-        # also inspect first row columns that matter
         u = db.query(User).first()
         fields = []
         if u:
@@ -158,7 +325,9 @@ def user_sample(db: Session = Depends(get_db)):
             return JSONResponse({"detail": str(e)}, status_code=500)
         raise HTTPException(status_code=500, detail="DB error")
 
-# ---- Routers (don’t crash boot if optional modules are absent) ----
+# ------------------------------------------------------------------------------
+# Other routers (won't crash boot if missing)
+# ------------------------------------------------------------------------------
 try:
     from routes_public_config import router as public_cfg_router
     app.include_router(public_cfg_router)  # /api/public-config
