@@ -12,3 +12,7 @@ openai
 email-validator
 python-jose[cryptography]
 httpx==0.27.2
+PyPDF2
+python-docx
+openpyxl
+requests

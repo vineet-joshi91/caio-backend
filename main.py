@@ -1,6 +1,6 @@
 # main.py
 import os, logging, traceback, json
-from typing import Optional
+from typing import Optional, List, Dict
 from datetime import datetime
 from io import BytesIO
 
@@ -23,7 +23,7 @@ DEBUG = os.getenv("DEBUG", "0") in ("1", "true", "TRUE", "yes", "YES")
 
 app = FastAPI(title="CAIO Backend", version="0.1.0")
 
-# Ensure tables exist (works for Postgres or SQLite fallback)
+# Ensure tables exist (Postgres or SQLite fallback)
 init_db()
 
 # ------------------------------------------------------------------------------
@@ -49,7 +49,6 @@ app.add_middleware(
     max_age=86400,
 )
 
-# Browser preflight helper (keeps OPTIONS happy even if specific route missing)
 @app.options("/{path:path}")
 def cors_preflight(path: str):
     return JSONResponse({"ok": True})
@@ -128,11 +127,37 @@ def profile(current_user: User = Depends(get_current_user)):
     }
 
 # ------------------------------------------------------------------------------
-# Analyze
-#   - Demo users → demo result (unchanged UX)
-#   - Pro users → real LLM if key present (OpenAI preferred, else OpenRouter)
-#   - If no key: return a Pro stub so end-to-end tests still succeed
+# Analyze (Demo capped at 2 brains; Pro = all brains; XLSX/PDF/DOCX/CSV/TXT; stub if no key)
 # ------------------------------------------------------------------------------
+DEFAULT_BRAINS_ORDER: List[str] = ["CFO", "COO", "CHRO", "CMO", "CPO"]
+
+def _choose_brains(requested: Optional[str], is_paid: bool) -> List[str]:
+    if requested:
+        items = [b.strip().upper() for b in requested.split(",") if b.strip()]
+        chosen = [b for b in items if b in DEFAULT_BRAINS_ORDER] or DEFAULT_BRAINS_ORDER[:]
+    else:
+        chosen = DEFAULT_BRAINS_ORDER[:]
+    return chosen if is_paid else chosen[:2]
+
+def _brain_prompt(brief: str, extracted: str, brain: str) -> str:
+    role_map: Dict[str, str] = {
+        "CFO": "Chief Financial Officer—analyze financials, ratios, variances, risks.",
+        "COO": "Chief Operating Officer—analyze processes, throughput, blockers.",
+        "CHRO": "Chief Human Resources Officer—analyze org/attrition/engagement.",
+        "CMO": "Chief Marketing Officer—analyze growth, CAC/LTV, channels.",
+        "CPO": "Chief Product Officer—analyze product strategy, roadmap, UX impact.",
+    }
+    role = role_map.get(brain, "Executive Advisor")
+    return (
+        f"You are {role}.\n"
+        "Return:\n"
+        "• Three concise insights\n"
+        "• Two concrete recommendations\n"
+        "Be specific and cite any numbers.\n\n"
+        f"BRIEF:\n{brief or '(none)'}\n\nDATA/TEXT:\n{extracted[:12000]}"
+    )
+
+# --- lightweight readers (no pandas) ---
 def _read_txt(body: bytes) -> str:
     try:
         return body.decode("utf-8", errors="ignore")
@@ -155,72 +180,84 @@ def _read_docx(body: bytes) -> str:
     except Exception:
         return ""
 
+def _read_csv(body: bytes) -> str:
+    try:
+        txt = body.decode("utf-8", errors="ignore")
+        return "\n".join(txt.splitlines()[:200])  # first ~200 lines
+    except Exception:
+        return ""
+
+def _read_xlsx(body: bytes) -> str:
+    try:
+        from openpyxl import load_workbook
+        wb = load_workbook(filename=BytesIO(body), data_only=True)
+        out: List[str] = []
+        for ws in wb.worksheets[:2]:  # first 2 sheets
+            out.append(f"# Sheet: {ws.title}")
+            for i, row in enumerate(ws.iter_rows(values_only=True), start=1):
+                if i > 200:  # first ~200 rows
+                    break
+                cells = ["" if c is None else str(c) for c in row]
+                out.append(",".join(cells))
+        return "\n".join(out)
+    except Exception:
+        return ""
+
 async def _extract_text(file: Optional[UploadFile]) -> str:
     if not file:
         return ""
     body = await file.read()
     name = (file.filename or "").lower()
-    if name.endswith(".pdf"):
-        return _read_pdf(body)
-    if name.endswith(".docx"):
-        return _read_docx(body)
-    return _read_txt(body)
+    if name.endswith(".pdf"):  return _read_pdf(body)
+    if name.endswith(".docx"): return _read_docx(body)
+    if name.endswith(".xlsx"): return _read_xlsx(body)
+    if name.endswith(".csv"):  return _read_csv(body)
+    return _read_txt(body)  # txt/md/unknown
 
 def _call_openai_chat(prompt: str) -> str:
     key = os.getenv("OPENAI_API_KEY")
     if not key:
         raise RuntimeError("OPENAI_API_KEY missing")
-
-    # Try SDK first; if it fails (version mismatch), fall back to REST
+    # Try SDK, then REST
     try:
         import openai
-        if hasattr(openai, "OpenAI"):  # new-style client
+        if hasattr(openai, "OpenAI"):
             client = openai.OpenAI(api_key=key)
-            resp = client.chat.completions.create(
+            r = client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.2,
             )
-            return resp.choices[0].message.content
-        else:  # legacy
+            return r.choices[0].message.content
+        else:
             openai.api_key = key
-            resp = openai.chat.completions.create(
+            r = openai.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.2,
             )
-            return resp.choices[0].message.content
-    except Exception as e:
-        # REST fallback (works without SDK)
+            return r.choices[0].message.content
+    except Exception:
         import requests
-        headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
-        data = {
-            "model": "gpt-4o-mini",
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.2,
-        }
-        r = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, data=json.dumps(data), timeout=60)
+        h = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+        d = {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": prompt}], "temperature": 0.2}
+        r = requests.post("https://api.openai.com/v1/chat/completions", headers=h, data=json.dumps(d), timeout=60)
         r.raise_for_status()
-        j = r.json()
-        return j["choices"][0]["message"]["content"]
+        return r.json()["choices"][0]["message"]["content"]
 
 def _call_openrouter_chat(prompt: str) -> str:
     key = os.getenv("OPENROUTER_API_KEY")
     if not key:
         raise RuntimeError("OPENROUTER_API_KEY missing")
     import requests
-    headers = {
+    h = {
         "Authorization": f"Bearer {key}",
         "HTTP-Referer": "https://caio-frontend.vercel.app",
         "X-Title": "CAIO",
         "Content-Type": "application/json",
     }
-    payload = {
-        "model": "openai/gpt-4o-mini",
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.2,
-    }
-    r = requests.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, data=json.dumps(payload), timeout=60)
+    d = {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": prompt}], "temperature": 0.2}
+    r = requests.post("https://openrouter.ai/api/v1/chat/completions", headers=h, data=json.dumps(d), timeout=60)
     r.raise_for_status()
     return r.json()["choices"][0]["message"]["content"]
 
@@ -229,64 +266,80 @@ async def analyze(
     request: Request,
     file: Optional[UploadFile] = File(None),
     text: Optional[str] = Form(None),
+    brains: Optional[str] = Form(None),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """
-    POST-only. If not paid → demo result.
-    If paid → extract text and run LLM (OpenAI preferred; else OpenRouter).
-    With no keys configured, return a Pro stub so UX still completes.
-    """
-    # DEMO users
+    # DEMO flow
     if not getattr(current_user, "is_paid", False):
+        chosen = _choose_brains(brains, is_paid=False)
         return JSONResponse(
             {
                 "status": "demo",
-                "title": "Demo Mode Result",
-                "summary": "This is a sample analysis. Upgrade to Pro for full insights.",
-                "tip": "Upload a business document or upgrade your plan to unlock advanced engines.",
+                "title": f"Demo Mode · {', '.join(chosen)}",
+                "summary": (
+                    "This is a demo preview. Upgrade to Pro to run all brains with real analysis.\n"
+                    f"Brains used: {', '.join(chosen)}"
+                ),
+                "tip": "Upload a business document or provide a brief to see the flow.",
             },
             status_code=200,
         )
 
-    # PRO users
-    extracted = await _extract_text(file)
+    # PRO flow
+    try:
+        extracted = await _extract_text(file)
+    except Exception as e:
+        logger.error("Extraction failed: %s\n%s", e, traceback.format_exc())
+        extracted = ""  # never hard fail; still allow brief-only
+
     brief = (text or "").strip()
+    chosen = _choose_brains(brains, is_paid=True)
+
     if not extracted and not brief:
         raise HTTPException(status_code=400, detail="Please upload a file or provide text")
 
-    prompt = (
-        "You are CAIO (Chief AI Officer). Read the user's brief and document text. "
-        "Return a concise summary (5 bullets) and 3 actionable recommendations.\n\n"
-        f"BRIEF:\n{brief or '(none)'}\n\nDOCUMENT:\n{extracted[:15000]}"
-    )
+    prompts = {b: _brain_prompt(brief, extracted, b) for b in chosen}
 
+    provider = "stub"
+    if os.getenv("OPENAI_API_KEY"):
+        provider = "openai"
+    elif os.getenv("OPENROUTER_API_KEY"):
+        provider = "openrouter"
+
+    summaries: Dict[str, str] = {}
     try:
-        if os.getenv("OPENAI_API_KEY"):
-            summary = _call_openai_chat(prompt)
-        elif os.getenv("OPENROUTER_API_KEY"):
-            summary = _call_openrouter_chat(prompt)
+        if provider == "openai":
+            for b, p in prompts.items():
+                summaries[b] = _call_openai_chat(p)
+        elif provider == "openrouter":
+            for b, p in prompts.items():
+                summaries[b] = _call_openrouter_chat(p)
         else:
-            # No keys configured → Pro stub so flows pass end-to-end
-            summary = (
-                "Stub summary (no LLM key configured). "
-                "This confirms file upload, extraction, and paid routing work.\n\n"
-                f"Extracted chars: {len(extracted)}"
-            )
-        return {
-            "status": "ok",
-            "title": "Analysis Complete",
-            "summary": summary,
-            "meta": {
-                "chars": len(extracted),
-                "provider": "openai" if os.getenv("OPENAI_API_KEY") else ("openrouter" if os.getenv("OPENROUTER_API_KEY") else "stub"),
-            },
-        }
+            for b in prompts.keys():
+                summaries[b] = (
+                    f"[Stub] {b} analysis (no API key configured). "
+                    f"Extracted chars: {len(extracted)} · Brief len: {len(brief)}."
+                )
     except Exception as e:
-        logger.error("Analyze failed: %s\n%s", e, traceback.format_exc())
-        if DEBUG:
-            return JSONResponse({"status": "error", "detail": str(e)}, status_code=500)
-        raise HTTPException(status_code=500, detail="Analysis failed")
+        # If the LLM call fails, fall back to stub so UX never breaks
+        logger.error("LLM failed, falling back to stub: %s\n%s", e, traceback.format_exc())
+        for b in prompts.keys():
+            summaries[b] = (
+                f"[Stub after error] {b} analysis. "
+                f"Reason: {e.__class__.__name__}. Extracted chars: {len(extracted)}."
+            )
+
+    combined = []
+    for b in chosen:
+        combined.append(f"### {b}\n{summaries[b]}")
+
+    return {
+        "status": "ok",
+        "title": f"Analysis Complete · {', '.join(chosen)}",
+        "summary": "\n\n".join(combined),
+        "meta": {"provider": provider, "brains": chosen, "chars": len(extracted)},
+    }
 
 # ------------------------------------------------------------------------------
 # Debug helpers
@@ -326,7 +379,7 @@ def user_sample(db: Session = Depends(get_db)):
         raise HTTPException(status_code=500, detail="DB error")
 
 # ------------------------------------------------------------------------------
-# Other routers (won't crash boot if missing)
+# Other routers (don’t crash boot if optional modules are missing)
 # ------------------------------------------------------------------------------
 try:
     from routes_public_config import router as public_cfg_router
