@@ -5,86 +5,133 @@ from sqlalchemy.orm import Session
 from typing import Any, Optional
 import os, httpx, hmac, hashlib, json, logging
 
+# Your project helpers (already exist in your repo)
 from db import get_db, User
 from auth import get_current_user
 
 logger = logging.getLogger("payments")
 
-# NOTE: prefix lives here; DO NOT add another prefix when including in main.py
+# The router is self-prefixed here; do NOT add another prefix in main.py
 router = APIRouter(prefix="/api/payments", tags=["payments"])
 
-# --- Environment ---
-RAZORPAY_KEY_ID = os.getenv("RAZORPAY_KEY_ID") or ""
-RAZORPAY_SECRET = os.getenv("RAZORPAY_SECRET") or ""
-WEBHOOK_SECRET  = os.getenv("RAZORPAY_WEBHOOK_SECRET") or ""
-PUBLIC_CONFIG_URL = os.getenv("PUBLIC_CONFIG_URL", "https://caio-backend.onrender.com/api/public-config")
+# ---------------------------------------------------------------------
+# Environment
+# ---------------------------------------------------------------------
 
-# Subscription knobs
-SUB_AMOUNT_INR      = int(os.getenv("CAIO_SUB_AMOUNT_INR", "499"))
+RAZORPAY_KEY_ID = (
+    os.getenv("RAZORPAY_KEY_ID")
+    or os.getenv("RAZORPAY_KEYID")  # tolerance
+    or ""
+)
+
+# Accept common secret names
+RAZORPAY_SECRET = (
+    os.getenv("RAZORPAY_SECRET")
+    or os.getenv("RAZORPAY_KEY_SECRET")
+    or os.getenv("RAZORPAY_SECRET_KEY")
+    or ""
+)
+
+RAZORPAY_WEBHOOK_SECRET = os.getenv("RAZORPAY_WEBHOOK_SECRET") or ""
+PUBLIC_CONFIG_URL       = os.getenv("PUBLIC_CONFIG_URL", "https://caio-backend.onrender.com/api/public-config")
+
+# Optional: force currency if your Razorpay account is not enabled for international
+PAYMENTS_FORCE_CURRENCY = (os.getenv("PAYMENTS_FORCE_CURRENCY") or "").upper().strip()
+
+# Subscription knobs (price now comes from region; these define cadence)
 SUB_INTERVAL        = os.getenv("CAIO_SUB_INTERVAL", "monthly")     # daily/weekly/monthly/yearly
 SUB_INTERVAL_COUNT  = int(os.getenv("CAIO_SUB_INTERVAL_COUNT", "1"))
 SUB_TOTAL_COUNT     = int(os.getenv("CAIO_SUB_TOTAL_COUNT", "12"))
-RAZORPAY_PLAN_ID    = (os.getenv("RAZORPAY_PLAN_ID") or "").strip()
-# Optional: pre-created subscription in Razorpay Dashboard (smoke test path)
-RAZORPAY_SUBSCRIPTION_ID = (os.getenv("RAZORPAY_SUBSCRIPTION_ID") or "").strip()
 
-# --- Razorpay client (lazy import so app can boot even if SDK missing) ---
+# Optional pre-provisioned items
+RAZORPAY_PLAN_ID          = (os.getenv("RAZORPAY_PLAN_ID") or "").strip()
+RAZORPAY_SUBSCRIPTION_ID  = (os.getenv("RAZORPAY_SUBSCRIPTION_ID") or "").strip()
+
+# ---------------------------------------------------------------------
+# Razorpay client (lazy import so API can still boot without the SDK)
+# ---------------------------------------------------------------------
+
 _rzp_client: Optional[Any] = None
-def get_client() -> Any:
+
+def get_client():
     global _rzp_client
     if _rzp_client:
         return _rzp_client
     if not (RAZORPAY_KEY_ID and RAZORPAY_SECRET):
         raise HTTPException(status_code=500, detail="Payments not configured (missing Razorpay keys).")
     try:
-        import razorpay  # lazy
+        import razorpay  # lazy import
     except Exception as e:
         logger.exception("Razorpay import failed")
         raise HTTPException(status_code=500, detail=f"Razorpay SDK not available: {e}")
     _rzp_client = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_SECRET))
     return _rzp_client
 
-# --- Helpers ---
+# ---------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------
+
 async def get_region_pricing(req: Request) -> tuple[str, int]:
     """
-    Returns (currency, amount_in_minor_units) for the 'pro' plan
-    using PUBLIC_CONFIG_URL (which can apply geo pricing).
+    Returns (currency, amount_minor) for Pro plan from PUBLIC_CONFIG.
+    Respects PAYMENTS_FORCE_CURRENCY. Falls back to USD 49 / INR 499.
     """
-    force = req.query_params.get("force")
-    params = {"force": force} if force else {}
-    async with httpx.AsyncClient(timeout=8.0) as x:
-        r = await x.get(PUBLIC_CONFIG_URL, params=params)
-        r.raise_for_status()
-        cfg = r.json()
+    DEFAULTS = {"USD": 49, "INR": 499}
+    force = req.query_params.get("force")  # e.g., ?force=US or ?force=IN
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as x:
+            r = await x.get(PUBLIC_CONFIG_URL, params={"force": force} if force else None)
+            r.raise_for_status()
+            cfg = r.json()
+    except Exception:
+        cfg = {}
+
     currency = (cfg.get("currency") or "INR").upper()
-    pro = (cfg.get("plans") or {}).get("pro") or {}
-    price_major = int(pro.get("price", SUB_AMOUNT_INR))
-    amount_minor = price_major * 100
+    if PAYMENTS_FORCE_CURRENCY:
+        currency = PAYMENTS_FORCE_CURRENCY
+
+    plans = cfg.get("plans") or {}
+    pro   = plans.get("pro") or {}
+    price_major = pro.get("price")
+
+    if price_major is None:
+        price_major = DEFAULTS.get(currency, 49)
+
+    # Guard: if USD 499 accidentally appears, correct to 49
+    try:
+        pm = float(price_major)
+    except Exception:
+        pm = 49.0
+    if currency == "USD" and pm >= 400:
+        pm = 49.0
+
+    amount_minor = int(round(pm * 100))
     return currency, amount_minor
 
 def _ensure_keys():
     if not (RAZORPAY_KEY_ID and RAZORPAY_SECRET):
         raise HTTPException(status_code=500, detail="Razorpay keys missing on server")
 
-def _create_or_get_plan(client: Any, currency: str) -> str:
-    """Use RAZORPAY_PLAN_ID if provided, else create a plan matching our interval/amount."""
+def _create_or_get_plan(client: Any, currency: str, amount_minor: int) -> str:
+    """
+    Use RAZORPAY_PLAN_ID if present; otherwise create a plan with region pricing.
+    """
     if RAZORPAY_PLAN_ID:
         return RAZORPAY_PLAN_ID
-    payload = {
+    plan = client.plan.create({
         "period": SUB_INTERVAL,
         "interval": SUB_INTERVAL_COUNT,
         "item": {
-            "name": f"CAIO Pro ({SUB_AMOUNT_INR} {currency}/{SUB_INTERVAL})",
-            "amount": SUB_AMOUNT_INR * 100,
+            "name": f"CAIO Pro ({amount_minor // 100} {currency}/{SUB_INTERVAL})",
+            "amount": amount_minor,
             "currency": currency,
         },
-    }
-    plan = client.plan.create(payload)
+    })
     return plan["id"]
 
-# -------------------------
+# ---------------------------------------------------------------------
 # Diagnostics
-# -------------------------
+# ---------------------------------------------------------------------
 
 @router.get("/ping")
 def ping():
@@ -100,9 +147,22 @@ def list_routes(request: Request):
             out.append({"path": path, "methods": methods})
     return out
 
-# -------------------------
-# BASIC CONFIG + ONE-TIME ORDER
-# -------------------------
+@router.get("/auth-check")
+def auth_check():
+    """
+    Lightweight auth probe to confirm key/secret are valid in the current mode.
+    """
+    try:
+        client = get_client()
+        _ = client.order.all({"count": 1})
+        return {"ok": True, "key_id": f"{RAZORPAY_KEY_ID[:10]}..."}
+    except Exception as e:
+        logger.exception("Auth check failed")
+        raise HTTPException(status_code=500, detail=f"Auth failed: {e}")
+
+# ---------------------------------------------------------------------
+# Basic config + one-time order (optional)
+# ---------------------------------------------------------------------
 
 @router.get("/config")
 async def payments_config(request: Request):
@@ -124,13 +184,13 @@ async def create_order(
     try:
         currency, amount_minor = await get_region_pricing(request)
         client = get_client()
-        order = client.order.create(dict(
-            amount=amount_minor,
-            currency=currency,
-            receipt=f"pro-{current_user.email}",
-            payment_capture=1,
-            notes={"email": current_user.email, "plan": "pro"},
-        ))
+        order = client.order.create({
+            "amount": amount_minor,
+            "currency": currency,
+            "receipt": f"pro-{current_user.email}",
+            "payment_capture": 1,
+            "notes": {"email": current_user.email, "plan": "pro"},
+        })
         return {
             "order_id": order["id"],
             "amount": order["amount"],
@@ -141,19 +201,19 @@ async def create_order(
         logger.exception("Create order error")
         raise HTTPException(status_code=500, detail=f"Create order failed: {e}")
 
-# -------------------------
-# SUBSCRIPTIONS
-# -------------------------
+# ---------------------------------------------------------------------
+# Subscriptions
+# ---------------------------------------------------------------------
 
 @router.get("/subscription-config")
 async def subscription_config(request: Request):
     _ensure_keys()
-    currency, _ = await get_region_pricing(request)
+    currency, amount_minor = await get_region_pricing(request)
     return {
         "mode": "razorpay",
         "currency": currency,
-        "amount_major": SUB_AMOUNT_INR,
-        "amount": SUB_AMOUNT_INR * 100,
+        "amount_major": amount_minor // 100,
+        "amount": amount_minor,
         "interval": f"every {SUB_INTERVAL_COUNT} {SUB_INTERVAL}",
         "key_id": RAZORPAY_KEY_ID,
     }
@@ -168,9 +228,9 @@ async def subscribe(
     if not current_user:
         raise HTTPException(status_code=401, detail="Unauthorized")
     try:
-        currency, _ = await get_region_pricing(request)
+        currency, amount_minor = await get_region_pricing(request)
         client = get_client()
-        plan_id = _create_or_get_plan(client, currency)
+        plan_id = _create_or_get_plan(client, currency, amount_minor)
         sub = client.subscription.create({
             "plan_id": plan_id,
             "total_count": SUB_TOTAL_COUNT,
@@ -182,12 +242,12 @@ async def subscribe(
         logger.exception("Subscription create error")
         raise HTTPException(status_code=500, detail=f"Subscription create failed: {e}")
 
-# GET alias so a POST 405 won’t break the flow
+# GET alias so a POST 405 won’t break flows behind proxies
 @router.get("/subscribe")
 async def subscribe_get(request: Request, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     return await subscribe(request, current_user, db)
 
-# Option B: use a subscription created in Razorpay Dashboard (for immediate smoke test)
+# Use a subscription created in Razorpay Dashboard (smoke test path)
 @router.get("/direct-subscription")
 def direct_subscription(current_user: User = Depends(get_current_user)):
     _ensure_keys()
@@ -258,9 +318,9 @@ async def cancel_subscription(
 
     return {"ok": True, "message": "Subscription cancelled"}
 
-# -------------------------
-# WEBHOOKS (order + subscription events)
-# -------------------------
+# ---------------------------------------------------------------------
+# Webhooks (order + subscription events)
+# ---------------------------------------------------------------------
 
 @router.post("/webhook")
 async def webhook(
@@ -268,14 +328,14 @@ async def webhook(
     x_razorpay_signature: str = Header(None),
     db: Session = Depends(get_db),
 ):
-    if not WEBHOOK_SECRET:
+    if not RAZORPAY_WEBHOOK_SECRET:
         raise HTTPException(status_code=500, detail="Webhook secret not configured")
     try:
         body_bytes = await request.body()
         payload = body_bytes.decode("utf-8")
 
         # Verify HMAC SHA256
-        digest = hmac.new(WEBHOOK_SECRET.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
+        digest = hmac.new(RAZORPAY_WEBHOOK_SECRET.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
         if not hmac.compare_digest(digest, (x_razorpay_signature or "")):
             return JSONResponse({"status": "invalid-signature"}, status_code=400)
 
@@ -327,9 +387,9 @@ async def webhook(
         logger.exception("Webhook processing error")
         return JSONResponse({"status": "error", "detail": str(e)}, status_code=500)
 
-# -------------------------
-# STATUS
-# -------------------------
+# ---------------------------------------------------------------------
+# Status
+# ---------------------------------------------------------------------
 
 @router.get("/status")
 async def status(current_user: User = Depends(get_current_user)):
