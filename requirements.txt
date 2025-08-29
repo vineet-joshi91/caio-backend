@@ -16,3 +16,4 @@ PyPDF2
 python-docx
 openpyxl
 requests
+reportlab

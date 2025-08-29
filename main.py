@@ -141,22 +141,47 @@ def _choose_brains(requested: Optional[str], is_paid: bool) -> List[str]:
     return chosen if is_paid else chosen[:2]
 
 def _brain_prompt(brief: str, extracted: str, brain: str) -> str:
-    role_map: Dict[str, str] = {
-        "CFO": "Chief Financial Officer—analyze financials, ratios, variances, risks.",
-        "COO": "Chief Operating Officer—analyze processes, throughput, blockers.",
-        "CHRO": "Chief Human Resources Officer—analyze org/attrition/engagement.",
-        "CMO": "Chief Marketing Officer—analyze growth, CAC/LTV, channels.",
-        "CPO": "Chief Product Officer—analyze product strategy, roadmap, UX impact.",
+    role_map = {
+    "CFO":  "Chief Financial Officer — own capital allocation and unit economics; analyze revenue mix, gross-margin bridge, OPEX discipline, pricing/discount leakage, cash conversion cycle (DSO/DPO/DIH), working-capital health, runway & covenant headroom, cohort LTV/CAC and payback, scenario planning and risk (FX, rates, credit).",
+    "COO":  "Chief Operating Officer — own cost-to-serve and reliability; analyze capacity & utilization, throughput, takt/cycle time, queue depth and SLA adherence, constraint/bottleneck analysis (TOC), FPY/defect rate and rework, on-time delivery, inventory turns & fulfillment, MTTR/MTBF, incident/safety rate, and logistics cost.",
+    "CHRO": "Chief Human Resources Officer — own organizational effectiveness; analyze attrition/retention and regretted loss, eNPS/engagement heat-maps, performance & succession matrices, span/layer and org design, pay equity & compensation bands, promotion velocity, compliance & ER cases, DEI pipeline health, learning hours and skills taxonomy.",
+    "CMO":  "Chief Marketing Officer — own efficient growth; analyze demand-mix and MMM/incrementality, CAC/LTV & payback by segment/channel, funnel conversion & leakage, creative testing (CTR/CVR) and lift, brand lift & share of voice, SEO/SEM and content velocity, partner/affiliate ROI, pricing/packaging signals, retention and reactivation.",
+    "CPO":  "Chief People Officer — own workforce planning & external talent acquisition; analyze req pipeline velocity/coverage, source-mix & channel ROI, recruiter productivity, time-to-hire and time-to-start, offer-acceptance & decliner reasons, cost-per-hire & vendor performance, quality-of-hire (90-day survival, time-to-productivity), geo strategy & workforce ramps, employer brand performance.",
     }
     role = role_map.get(brain, "Executive Advisor")
-    return (
-        f"You are {role}.\n"
-        "Return:\n"
-        "• Three concise insights\n"
-        "• Two concrete recommendations\n"
-        "Be specific and cite any numbers.\n\n"
-        f"BRIEF:\n{brief or '(none)'}\n\nDATA/TEXT:\n{extracted[:12000]}"
-    )
+
+    # One-message (user) prompt that behaves like a system+user combo.
+    # Keeps your existing _call_openai/_call_openrouter unchanged.
+    return f"""
+You are {role}.
+Return STRICT MARKDOWN ONLY for **{brain}** with this structure and nothing else:
+
+### Insights
+1. <concise, concrete insight using data in the brief/text>
+2. <insight>
+3. <insight>
+4. <optional – only if strong>
+5. <optional – only if strong>
+
+### Recommendations
+1. **<3–6 word unique headline>**: <ONE sentence action tailored to {brain}; include a lever/metric/₹/$/% or timeline.>
+2. **<different headline>**: <ONE sentence action.>
+3. **<different headline>**: <ONE sentence action.>
+
+RULES
+- Number lists EXACTLY "1. ", "2. ", ... (never "1.:"; no blank items).
+- Each recommendation MUST start with **bold headline** then a colon + ONE sentence.
+- Headlines must be unique within {brain} and should avoid repeating the same lead verb across roles.
+  Prefer varied verbs: Rebalance, Optimize, Streamline, De-risk, Accelerate, Elevate, Consolidate, Diversify.
+- Be specific and actionable (add a lever/metric/timeline/owner where possible).
+- NO extra sections, code blocks, preambles, or explanations. Markdown only.
+
+[BRIEF]
+{brief or "(none)"}
+
+[DOCUMENT TEXT]
+{(extracted or "")[:120000]}
+""".strip()
 
 # ---------- lightweight readers ----------
 def _read_txt(body: bytes) -> str:
@@ -455,3 +480,133 @@ try:
     app.include_router(maintenance_router)
 except Exception as e:
     logger.warning(f"maintenance_routes not loaded: {e}")
+
+# ===================== EXPORT ENDPOINTS (PRO ONLY) =====================
+from fastapi import Body
+from fastapi.responses import StreamingResponse
+from docx import Document
+from docx.shared import Pt
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfgen import canvas
+from textwrap import wrap
+
+def _ensure_pro(current_user: User):
+    if not bool(getattr(current_user, "is_paid", False)):
+        raise HTTPException(status_code=403, detail="Export is available to Pro accounts only.")
+
+def _parse_analysis_md(md_text: str) -> list[tuple[str, str]]:
+    """
+    Quick splitter: returns [(brain, content_markdown), ...]
+    Assumes sections start with '### {BRAIN}' like we generate.
+    """
+    parts = []
+    current_brain = None
+    buf = []
+    for line in md_text.splitlines():
+        if line.startswith("### "):
+            # flush previous
+            if current_brain:
+                parts.append((current_brain, "\n".join(buf).strip()))
+                buf = []
+            current_brain = line.replace("###", "").strip()
+        else:
+            buf.append(line)
+    if current_brain:
+        parts.append((current_brain, "\n".join(buf).strip()))
+    return parts or [("Analysis", md_text)]
+
+def _write_docx(title: str, md_text: str) -> BytesIO:
+    doc = Document()
+    doc.styles['Normal'].font.name = 'Calibri'
+    doc.styles['Normal'].font.size = Pt(11)
+
+    doc.add_heading(title or "CAIO Analysis", level=1)
+
+    for brain, content in _parse_analysis_md(md_text):
+        doc.add_heading(brain, level=2)
+        # simple markdown bullets → Word paragraphs
+        for para in content.split("\n\n"):
+            p = para.strip()
+            if not p:
+                continue
+            if p.startswith(("* ", "- ")):
+                # bullet list
+                for line in p.splitlines():
+                    if line.strip().startswith(("* ", "- ")):
+                        doc.add_paragraph(line.strip()[2:], style=None).style = None
+                        doc.paragraphs[-1].style = doc.styles['List Bullet']
+            elif p[0:2].isdigit() or p.startswith("1. "):
+                # numbered-ish: split on lines that start with N.
+                for line in p.splitlines():
+                    doc.add_paragraph(line.split(". ", 1)[-1], style=None)
+                    doc.paragraphs[-1].style = doc.styles['List Number']
+            else:
+                doc.add_paragraph(p)
+
+    bio = BytesIO()
+    doc.save(bio)
+    bio.seek(0)
+    return bio
+
+def _write_pdf(title: str, md_text: str) -> BytesIO:
+    # Simple text PDF; for fancier layout we can switch to reportlab platypus later
+    bio = BytesIO()
+    c = canvas.Canvas(bio, pagesize=A4)
+    width, height = A4
+    left, top = 50, height - 50
+    y = top
+
+    def draw_line(text, bold=False):
+        nonlocal y
+        if y < 60:
+            c.showPage()
+            y = top
+        c.setFont("Helvetica-Bold" if bold else "Helvetica", 11 if not bold else 12)
+        # wrap lines to page width
+        max_chars = 95
+        for wline in wrap(text, max_chars):
+            c.drawString(left, y, wline)
+            y -= 14
+
+    draw_line(title or "CAIO Analysis", bold=True)
+    y -= 8
+
+    for brain, content in _parse_analysis_md(md_text):
+        y -= 4
+        draw_line(brain, bold=True)
+        y -= 6
+        for para in content.split("\n\n"):
+            p = para.strip()
+            if not p:
+                continue
+            for line in p.splitlines():
+                draw_line(line)
+
+    c.save()
+    bio.seek(0)
+    return bio
+
+@app.post("/api/export/docx")
+def export_docx(
+    payload: dict = Body(..., example={"title": "Analysis Complete · CFO, COO...", "markdown": "### CFO\n• ..."}),
+    current_user: User = Depends(get_current_user),
+):
+    _ensure_pro(current_user)
+    title = (payload.get("title") or "CAIO Analysis").strip()
+    md = payload.get("markdown") or ""
+    stream = _write_docx(title, md)
+    headers = {"Content-Disposition": f'attachment; filename="CAIO-Analysis.docx"'}
+    return StreamingResponse(stream, media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document", headers=headers)
+
+@app.post("/api/export/pdf")
+def export_pdf(
+    payload: dict = Body(..., example={"title": "Analysis Complete · CFO, COO...", "markdown": "### CFO\n• ..."}),
+    current_user: User = Depends(get_current_user),
+):
+    _ensure_pro(current_user)
+    title = (payload.get("title") or "CAIO Analysis").strip()
+    md = payload.get("markdown") or ""
+    stream = _write_pdf(title, md)
+    headers = {"Content-Disposition": f'attachment; filename="CAIO-Analysis.pdf"'}
+    return StreamingResponse(stream, media_type="application/pdf", headers=headers)
+# =================== END EXPORT ENDPOINTS ===================
