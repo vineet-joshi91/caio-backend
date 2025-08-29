@@ -17,3 +17,4 @@ python-docx
 openpyxl
 requests
 reportlab
+razorpay==1.4.2

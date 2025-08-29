@@ -448,6 +448,16 @@ def user_sample(db: Session = Depends(get_db)):
             return JSONResponse({"detail": str(e)}, status_code=500)
         raise HTTPException(status_code=500, detail="DB error")
 
+@app.get("/api/debug/routers")
+def debug_routers():
+    out = []
+    for r in app.routes:
+        methods = sorted(list(getattr(r, "methods", [])))
+        path = getattr(r, "path", "")
+        if path.startswith("/api/"):
+            out.append({"path": path, "methods": methods})
+    return out
+
 # ------------------------------------------------------------------------------
 # Other routers (don’t crash boot if optional modules are missing)
 # ------------------------------------------------------------------------------
@@ -457,11 +467,13 @@ try:
 except Exception as e:
     logger.warning(f"routes_public_config not loaded: {e}")
 
-try:
-    from payment_routes import router as payments_router
-    app.include_router(payments_router)  # already prefixed with /api/payments
-except Exception as e:
-    logger.warning(f"payment_routes not loaded: {e}")
+# ---- Payments router (Razorpay) ----
+import logging
+logger = logging.getLogger("uvicorn.error")
+
+from payment_routes import router as payments_router   # <-- will raise on import errors
+app.include_router(payments_router)                    # prefix is defined inside payment_routes.py
+logger.info("✅ payments_router mounted")
 
 try:
     from contact_routes import router as contact_router
