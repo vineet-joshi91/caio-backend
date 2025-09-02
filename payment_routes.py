@@ -3,10 +3,15 @@ from __future__ import annotations
 import os, json, hmac, hashlib, logging
 from typing import Dict, Any, Optional, Tuple
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request, Depends
 from pydantic import BaseModel
+from sqlalchemy.orm import Session
 
-# Optional import guard so local dev doesn't break if the lib isn't installed
+# Your project imports (present in main.py)
+from db import get_db, User
+from auth import get_current_user
+
+# Razorpay SDK (optional guard so local dev without the lib doesn't crash)
 try:
     import razorpay
     from razorpay.errors import BadRequestError, ServerError, SignatureVerificationError
@@ -25,41 +30,37 @@ RZP_KEY_ID = os.getenv("RAZORPAY_KEY_ID", "").strip()
 RZP_SECRET = os.getenv("RAZORPAY_SECRET", "").strip()
 RZP_WEBHOOK_SECRET = os.getenv("RAZORPAY_WEBHOOK_SECRET", "").strip()
 
-# Which currency to use if we can't detect anything
 DEFAULT_CURRENCY = os.getenv("PAY_DEFAULT_CURRENCY", "INR").upper()
 
-# Interval copy (purely for display)
-PAY_PERIOD = os.getenv("PAY_PERIOD", "monthly")
-PAY_INTERVAL = int(os.getenv("PAY_INTERVAL", "1"))
+# Interval copy (display only)
+PAY_PERIOD = os.getenv("PAY_PERIOD", "monthly")      # plan.period
+PAY_INTERVAL = int(os.getenv("PAY_INTERVAL", "1"))   # plan.interval
 PAY_INTERVAL_TEXT = os.getenv("PAY_INTERVAL_TEXT", "every 1 monthly")
 
-# Pricing is data-driven via JSON. Edit the env only.
-# Example (default when env missing):
-# {"INR":{"amount_major":499,"symbol":"₹"},"USD":{"amount_major":49,"symbol":"$"}}
+# Pricing via env JSON (currency -> {amount_major, symbol})
+# Example: {"INR":{"amount_major":2999,"symbol":"₹"},"USD":{"amount_major":49,"symbol":"$"}}
 def _load_pricing() -> Dict[str, Dict[str, Any]]:
     raw = os.getenv("PRICING_JSON", "").strip()
     if raw:
         try:
             data = json.loads(raw)
-            # normalize keys
             return {k.upper(): v for k, v in data.items()}
         except Exception as e:
             log.warning("Invalid PRICING_JSON, using defaults. %s", e)
     return {
-        "INR": {"amount_major": 499, "symbol": "₹"},
-        "USD": {"amount_major": 49,  "symbol": "$"},
+        "INR": {"amount_major": 2999, "symbol": "₹"},
+        "USD": {"amount_major": 49,   "symbol": "$"},
     }
 
 PRICING = _load_pricing()
 ALLOWED_CURRENCIES = set(PRICING.keys())
-
 HAS_SECRET = bool(RZP_SECRET)
 
 _rzp: Optional["razorpay.Client"] = None
 if razorpay and RZP_KEY_ID and RZP_SECRET:
     _rzp = razorpay.Client(auth=(RZP_KEY_ID, RZP_SECRET))
 else:
-    log.warning("Razorpay client not initialized (missing keys or lib).")
+    log.warning("Razorpay client not initialized (missing keys or library).")
 
 # In-memory cache: (currency, amount, period, interval) -> plan_id
 PLAN_CACHE: Dict[Tuple[str, int, str, int], str] = {}
@@ -68,38 +69,36 @@ PLAN_CACHE: Dict[Tuple[str, int, str, int], str] = {}
 
 def _pick_currency(request: Request, explicit: Optional[str]) -> str:
     """
-    1) If explicit currency provided and supported -> use it.
-    2) Else detect from headers (IN -> INR, else USD if available).
-    3) Else fallback to DEFAULT_CURRENCY (if supported), otherwise first available.
+    Priority:
+      1) explicit query/body
+      2) geo hints (IN => INR else USD if available)
+      3) DEFAULT_CURRENCY
+      4) first available
     """
     if explicit:
         c = explicit.upper()
         if c in ALLOWED_CURRENCIES:
             return c
-        raise HTTPException(status_code=400, detail=f"Unsupported currency: {explicit}")
+        raise HTTPException(400, f"Unsupported currency: {explicit}")
 
-    # Geo hints from common CDNs / platforms
     cc = (
         request.headers.get("x-vercel-ip-country")
         or request.headers.get("cf-ipcountry")
         or request.headers.get("x-country-code")
         or ""
     ).upper()
-
     if cc == "IN" and "INR" in ALLOWED_CURRENCIES:
         return "INR"
     if "USD" in ALLOWED_CURRENCIES:
         return "USD"
-
-    # fallback
     if DEFAULT_CURRENCY in ALLOWED_CURRENCIES:
         return DEFAULT_CURRENCY
-    return next(iter(ALLOWED_CURRENCIES))  # last-resort
+    return next(iter(ALLOWED_CURRENCIES))
 
 def _pricing_for(currency: str) -> Dict[str, Any]:
     cfg = PRICING.get(currency.upper())
     if not cfg or "amount_major" not in cfg:
-        raise HTTPException(status_code=500, detail=f"Pricing missing for {currency}")
+        raise HTTPException(500, f"Pricing missing for {currency}")
     return cfg
 
 def _ensure_plan(currency: str, amount_major: int) -> str:
@@ -107,7 +106,7 @@ def _ensure_plan(currency: str, amount_major: int) -> str:
     if key in PLAN_CACHE:
         return PLAN_CACHE[key]
     if not _rzp:
-        raise HTTPException(status_code=503, detail="Razorpay not initialized on server.")
+        raise HTTPException(503, "Razorpay not initialized on server.")
     try:
         plan = _rzp.plan.create(
             {
@@ -124,10 +123,10 @@ def _ensure_plan(currency: str, amount_major: int) -> str:
         return plan["id"]
     except BadRequestError as e:
         msg = getattr(e, "args", [str(e)])[0]
-        raise HTTPException(status_code=400, detail=f"Plan create failed: {msg}") from e
+        raise HTTPException(400, f"Plan create failed: {msg}") from e
     except ServerError as e:
         msg = getattr(e, "args", [str(e)])[0]
-        raise HTTPException(status_code=502, detail=f"Razorpay server error: {msg}") from e
+        raise HTTPException(502, f"Razorpay server error: {msg}") from e
 
 # ------------------------- Routes -------------------------------------------
 
@@ -137,36 +136,48 @@ def ping():
 
 @router.get("/subscription-config")
 def subscription_config(request: Request, currency: Optional[str] = None):
+    """
+    Boot payload for the frontend.
+    """
     display_currency = _pick_currency(request, currency)
-    out = {
+    return {
         "mode": MODE,
         "key_id": RZP_KEY_ID or None,
         "has_secret": HAS_SECRET,
         "interval": PAY_INTERVAL_TEXT,
         "defaultCurrency": display_currency,
-        "pricing": PRICING,  # frontend can render toggle if >1
+        "pricing": PRICING,
     }
-    return out
+# (keeps the shape your page expects)  # <-- existing behavior preserved
 
 class CreateBody(BaseModel):
     currency: Optional[str] = None
     notes: Optional[Dict[str, Any]] = None
 
 @router.post("/subscription/create", status_code=201)
-def create_subscription(request: Request, body: CreateBody):
+def create_subscription(
+    request: Request,
+    body: CreateBody,
+    current_user: User = Depends(get_current_user),   # ensure auth
+):
     if MODE != "razorpay":
-        raise HTTPException(status_code=400, detail="Only Razorpay mode is implemented.")
+        raise HTTPException(400, "Only Razorpay mode is implemented.")
     currency = _pick_currency(request, body.currency)
     p = _pricing_for(currency)
     amount_major = int(p["amount_major"])
 
     plan_id = _ensure_plan(currency, amount_major)
 
+    # propagate email to notes to help webhook lookup
+    notes = dict(body.notes or {})
+    notes.setdefault("email", getattr(current_user, "email", ""))
+
     try:
         sub = _rzp.subscription.create(
-            {"plan_id": plan_id, "total_count": 0, "customer_notify": 1, "notes": body.notes or {}}
+            {"plan_id": plan_id, "total_count": 0, "customer_notify": 1, "notes": notes}
         )
         return {
+            "key_id": RZP_KEY_ID or None,
             "currency": currency,
             "amount_major": amount_major,
             "plan_id": plan_id,
@@ -177,26 +188,105 @@ def create_subscription(request: Request, body: CreateBody):
         }
     except BadRequestError as e:
         msg = getattr(e, "args", [str(e)])[0]
-        raise HTTPException(status_code=400, detail=f"Subscription create failed: {msg}") from e
+        raise HTTPException(400, f"Subscription create failed: {msg}") from e
     except ServerError as e:
         msg = getattr(e, "args", [str(e)])[0]
-        raise HTTPException(status_code=502, detail=f"Razorpay server error: {msg}") from e
+        raise HTTPException(502, f"Razorpay server error: {msg}") from e
+# (your file already had /subscription/create; we tightened & added key_id) :contentReference[oaicite:2]{index=2}
+
+# ----- Optional verify endpoint (UI can call after handler; webhook is source of truth)
+
+class VerifyBody(BaseModel):
+    payload: Optional[Dict[str, Any]] = None
+
+@router.post("/verify")
+def verify_payment(_: VerifyBody, current_user: User = Depends(get_current_user)):
+    return {"ok": True, "note": "Verification deferred to webhook"}
+
+# ---------------------------- Cancel endpoint --------------------------------
+
+class CancelBody(BaseModel):
+    subscription_id: str
+
+@router.post("/cancel")
+def cancel_subscription(
+    body: CancelBody,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if not _rzp:
+        raise HTTPException(503, "Razorpay not initialized on server.")
+    try:
+        sub = _rzp.subscription.cancel(body.subscription_id, {"cancel_at_cycle_end": 0})
+    except BadRequestError as e:
+        msg = getattr(e, "args", [str(e)])[0]
+        raise HTTPException(400, f"Cancel failed: {msg}") from e
+    except ServerError as e:
+        msg = getattr(e, "args", [str(e)])[0]
+        raise HTTPException(502, f"Razorpay server error: {msg}") from e
+
+    # mark user as free
+    try:
+        current_user.is_paid = False
+        db.add(current_user); db.commit()
+    except Exception as e:
+        log.warning("Cancel OK at gateway but DB flag update failed: %s", e)
+
+    return {"ok": True, "status": sub.get("status"), "raw": sub}
+
+# -------------------------- Webhook (authoritative) --------------------------
 
 @router.post("/razorpay/webhook")
-async def razorpay_webhook(request: Request):
+async def razorpay_webhook(request: Request, db: Session = Depends(get_db)):
+    """
+    subscription.activated / invoice.paid => user.is_paid = True
+    subscription.cancelled                => user.is_paid = False
+    """
     if not RZP_WEBHOOK_SECRET:
-        raise HTTPException(status_code=503, detail="Webhook secret not configured")
+        raise HTTPException(503, "Webhook secret not configured")
+
     body = await request.body()
     signature = request.headers.get("X-Razorpay-Signature", "")
+
+    # Razorpay: HMAC-SHA256 hex digest over raw body
+    expected = hmac.new(RZP_WEBHOOK_SECRET.encode(), body, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected, signature or ""):
+        raise HTTPException(401, "Invalid signature")
+
+    event = json.loads(body.decode("utf-8"))
+    etype = event.get("event", "")
+    payload = event.get("payload", {}) or {}
+
+    # Extract user email we put into notes during creation
+    email: Optional[str] = None
+    sub_entity = (payload.get("subscription") or {}).get("entity") or {}
+    email = (sub_entity.get("notes") or {}).get("email") or email
+
+    inv_entity = (payload.get("invoice") or {}).get("entity") or {}
+    if not email:
+        email = (inv_entity.get("customer_details") or {}).get("email")
+
+    if not email:
+        log.warning("Webhook %s without resolvable email; payload keys=%s", etype, list(payload.keys()))
+        return {"ok": True, "note": "no-email-in-payload"}
+
+    # Update user flag
+    user: Optional[User] = db.query(User).filter(User.email == email).first()
+    if not user:
+        log.warning("Webhook %s: user not found for email=%s", etype, email)
+        return {"ok": True, "note": "user-not-found"}
+
     try:
-        expected = hmac.new(RZP_WEBHOOK_SECRET.encode(), body, hashlib.sha256).hexdigest()
-        if not hmac.compare_digest(expected, signature):
-            raise SignatureVerificationError("Invalid signature", None)  # type: ignore
-        payload = json.loads(body.decode("utf-8"))
-        log.info("Webhook OK: %s", payload.get("event"))
-        return {"ok": True}
-    except SignatureVerificationError:
-        raise HTTPException(status_code=400, detail="Invalid signature")
+        if etype in ("subscription.activated", "invoice.paid"):
+            user.is_paid = True
+        elif etype in ("subscription.cancelled",):
+            user.is_paid = False
+        else:
+            return {"ok": True, "note": f"ignored:{etype}"}
+
+        db.add(user); db.commit()
     except Exception as e:
-        log.exception("Webhook error: %s", e)
-        raise HTTPException(status_code=500, detail="Webhook processing error")
+        log.error("Webhook DB update failed: %s", e)
+        raise HTTPException(500, "DB update failed")
+
+    return {"ok": True, "email": email, "event": etype}
