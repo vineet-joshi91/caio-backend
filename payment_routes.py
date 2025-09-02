@@ -174,7 +174,7 @@ def create_subscription(
 
     try:
         sub = _rzp.subscription.create(
-            {"plan_id": plan_id, "total_count": 0, "customer_notify": 1, "notes": notes}
+            {"plan_id": plan_id, "total_count": 12, "customer_notify": 1, "notes": notes}
         )
         return {
             "key_id": RZP_KEY_ID or None,
