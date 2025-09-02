@@ -50,7 +50,7 @@ async def public_config(request: Request, force: Optional[str] = None):
     # You can pull these from env later if you want
     if region == "IN":
         currency = "INR"
-        pro_price = 1999
+        pro_price = 2999
         period = "month"
     else:
         currency = "USD"
