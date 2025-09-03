@@ -55,6 +55,15 @@ def health():
 def ready():
     return {"ready": True, "time": datetime.utcnow().isoformat() + "Z"}
 
+@app.get("/health")
+def health():
+    return {"ok": True}
+
+@app.get("/ready")
+def ready():
+    return {"ready": True}
+
+
 # ------------------------------------------------------------------------------
 # Auth
 # ------------------------------------------------------------------------------
