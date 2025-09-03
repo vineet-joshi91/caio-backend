@@ -1,60 +1,63 @@
 # main.py
-import os, logging, traceback, json
-from typing import Optional, List, Dict
+import os
+import re
+from typing import Optional, List, Dict, Tuple
 from datetime import datetime
 from io import BytesIO
+from textwrap import wrap
 
-from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Request, Body
+from fastapi import (
+    FastAPI, Depends, HTTPException, UploadFile, File, Form, Request, Body, Query
+)
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
 
-from db import get_db, User, init_db
+from db import get_db, User, init_db, UsageLog
 from auth import create_access_token, verify_password, get_password_hash, get_current_user
+from payment_routes import router as payments_router
+from routes_public_config import router as public_config_router
+
+# Export libs
+from docx import Document
+from docx.shared import Pt
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfgen import canvas
 
 # ------------------------------------------------------------------------------
-# App + logging
-# ------------------------------------------------------------------------------
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("caio")
-
-DEBUG = os.getenv("DEBUG", "0") in ("1", "true", "TRUE", "yes", "YES")
-
-app = FastAPI(title="CAIO Backend", version="0.1.0")
-
-# Ensure tables exist
-init_db()
-
-# ------------------------------------------------------------------------------
-# CORS (explicit origins; '*' is invalid when allow_credentials=True)
+# Config
 # ------------------------------------------------------------------------------
 DEFAULT_ORIGINS = "https://caio-frontend.vercel.app,https://caioai.netlify.app,http://localhost:3000"
-origins = [
+ALLOWED = [
     o.strip()
     for o in os.getenv("ALLOWED_ORIGINS", DEFAULT_ORIGINS).split(",")
     if o.strip()
 ]
+FREE_QUERIES_PER_DAY = int(os.getenv("FREE_QUERIES_PER_DAY", "3"))
+
+PREFERRED_ORDER = ["CFO", "CHRO", "COO", "CMO", "CPO"]
+
+# ------------------------------------------------------------------------------
+# App
+# ------------------------------------------------------------------------------
+app = FastAPI(title="CAIO Backend", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=ALLOWED,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ------------------------------------------------------------------------------
-# Health / Ready
-# ------------------------------------------------------------------------------
-@app.get("/api/health")
-def health():
-    return {"status": "ok", "version": "0.1.0"}
+app.include_router(payments_router)
+app.include_router(public_config_router)
+init_db()
 
-@app.get("/api/ready")
-def ready():
-    return {"ready": True, "time": datetime.utcnow().isoformat() + "Z"}
-
+# ------------------------------------------------------------------------------
+# Health
+# ------------------------------------------------------------------------------
 @app.get("/health")
 def health():
     return {"ok": True}
@@ -63,59 +66,54 @@ def health():
 def ready():
     return {"ready": True}
 
+@app.options("/{path:path}")
+def cors_preflight(path: str):
+    return JSONResponse({"ok": True})
 
 # ------------------------------------------------------------------------------
 # Auth
 # ------------------------------------------------------------------------------
-ADMIN_EMAILS = {
-    e.strip().lower()
-    for e in os.getenv("ADMIN_EMAILS", "vineetpjoshi.71@gmail.com").split(",")
-    if e.strip()
-}
+@app.post("/api/signup")
+def signup(
+    email: str = Form(...),
+    password: str = Form(...),
+    db: Session = Depends(get_db),
+):
+    existing = db.query(User).filter(User.email == email).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="User already exists")
 
-def _login_core(email: str, password: str, db: Session):
-    if not email or not password:
-        raise HTTPException(status_code=400, detail="Email and password required")
-
-    user = db.query(User).filter(User.email == email).first()
-    if user:
-        if not hasattr(user, "hashed_password"):
-            raise RuntimeError("User model missing 'hashed_password' column")
-        if not verify_password(password, user.hashed_password):
-            raise HTTPException(status_code=400, detail="Incorrect email or password")
-    else:
-        hpw = get_password_hash(password)
-        user = User(
-            email=email,
-            hashed_password=hpw if hasattr(User, "hashed_password") else None,
-            is_admin=(email in ADMIN_EMAILS) if hasattr(User, "is_admin") else False,
-            is_paid=False if hasattr(User, "is_paid") else False,
-            created_at=datetime.utcnow() if hasattr(User, "created_at") else None,
-        )
-        db.add(user); db.commit(); db.refresh(user)
+    user = User(
+        email=email,
+        hashed_password=get_password_hash(password),
+        is_admin=False,
+        is_paid=False,
+        created_at=datetime.utcnow(),
+    )
+    db.add(user); db.commit(); db.refresh(user)
 
     token = create_access_token(sub=user.email)
     return {
         "access_token": token,
         "token_type": "bearer",
         "email": user.email,
-        "is_admin": bool(getattr(user, "is_admin", False)),
-        "is_paid": bool(getattr(user, "is_paid", False)),
+        "is_admin": bool(user.is_admin),
+        "is_paid": bool(user.is_paid),
     }
 
 @app.post("/api/login")
-def login(form: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
-    try:
-        email = (form.username or "").strip().lower()
-        password = form.password or ""
-        return _login_core(email, password, db)
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error("Login failed: %s\n%s", e, traceback.format_exc())
-        if DEBUG:
-            return JSONResponse({"detail": f"login-500: {e.__class__.__name__}: {e}"}, status_code=500)
-        raise HTTPException(status_code=500, detail="Login failed")
+def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.email == form_data.username).first()
+    if not user or not verify_password(form_data.password, user.hashed_password):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    token = create_access_token(sub=user.email)
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "email": user.email,
+        "is_admin": bool(user.is_admin),
+        "is_paid": bool(user.is_paid),
+    }
 
 @app.get("/api/profile")
 def profile(current_user: User = Depends(get_current_user)):
@@ -127,386 +125,330 @@ def profile(current_user: User = Depends(get_current_user)):
     }
 
 # ------------------------------------------------------------------------------
-# Analyze (demo vs pro) — unchanged behavior
+# Usage limits
 # ------------------------------------------------------------------------------
-DEFAULT_BRAINS_ORDER: List[str] = ["CFO", "COO", "CHRO", "CMO", "CPO"]
+def _today_range_utc():
+    now = datetime.utcnow()
+    return datetime(now.year, now.month, now.day), datetime(now.year, now.month, now.day, 23, 59, 59, 999999)
 
-def _choose_brains(requested: Optional[str], is_paid: bool) -> List[str]:
-    if requested:
-        items = [b.strip().upper() for b in requested.split(",") if b.strip()]
-        chosen = [b for b in items if b in DEFAULT_BRAINS_ORDER] or DEFAULT_BRAINS_ORDER[:]
-    else:
-        chosen = DEFAULT_BRAINS_ORDER[:]
-    return chosen if is_paid else chosen[:2]
+def _check_and_increment_usage(db: Session, user: User, endpoint: str = "analyze"):
+    if bool(getattr(user, "is_paid", False)):
+        db.add(UsageLog(user_id=getattr(user, "id", 0) or 0, timestamp=datetime.utcnow(), endpoint=endpoint, status="ok"))
+        db.commit()
+        return
+    start, end = _today_range_utc()
+    count = (
+        db.query(UsageLog)
+        .filter(UsageLog.user_id == getattr(user, "id", 0))
+        .filter(UsageLog.endpoint == endpoint)
+        .filter(UsageLog.timestamp >= start)
+        .filter(UsageLog.timestamp <= end)
+        .count()
+    )
+    if count >= FREE_QUERIES_PER_DAY:
+        raise HTTPException(status_code=429, detail="Daily free limit reached. Upgrade to Pro for unlimited analyses.")
+    db.add(UsageLog(user_id=getattr(user, "id", 0) or 0, timestamp=datetime.utcnow(), endpoint=endpoint, status="ok"))
+    db.commit()
 
-def _brain_prompt(brief: str, extracted: str, brain: str) -> str:
-    role_map = {
-        "CFO":"Chief Financial Officer — own capital allocation and unit economics; analyze revenue mix, margins, OPEX, CCC, runway.",
-        "COO":"Chief Operating Officer — own cost-to-serve and reliability; capacity, throughput, SLA, FPY/defects, MTTR/MTBF.",
-        "CHRO":"Chief Human Resources Officer — org effectiveness; attrition, engagement, span/layer, equity, performance, DEI.",
-        "CMO":"Chief Marketing Officer — efficient growth; MMM, CAC/LTV, funnel, creative lift, SEO/SEM, retention/reactivation.",
-        "CPO":"Chief People Officer — talent acquisition; pipeline, source mix, time-to-hire, CPH, QoH, geo strategy, brand.",
-    }
-    role = role_map.get(brain, "Executive Advisor")
-    return f"""
-You are {role}.
-Return STRICT MARKDOWN ONLY for **{brain}** with this structure and nothing else:
+def _ensure_pro(current_user: User):
+    if not bool(getattr(current_user, "is_paid", False)):
+        raise HTTPException(status_code=403, detail="Export is available to Pro accounts only.")
 
-### Insights
-1. <insight>
-2. <insight>
-3. <insight>
-
-### Recommendations
-1. **<headline>**: <ONE sentence action.>
-2. **<headline>**: <ONE sentence action.>
-3. **<headline>**: <ONE sentence action.>
-
-[BRIEF]
-{brief or "(none)"}
-
-[DOCUMENT TEXT]
-{(extracted or "")[:120000]}
-""".strip()
-
-def _read_txt(body: bytes) -> str:
+# ------------------------------------------------------------------------------
+# File reading helper
+# ------------------------------------------------------------------------------
+async def _read_upload_as_text(up: UploadFile) -> str:
+    if not up: return ""
+    body = await up.read()
+    name = (up.filename or "").lower()
+    if name.endswith((".txt", ".md", ".csv", ".tsv")):
+        try: return body.decode("utf-8", errors="ignore")
+        except Exception: return ""
+    if name.endswith(".docx"):
+        try:
+            from docx import Document as _Docx
+            return "\n".join(p.text for p in _Docx(BytesIO(body)).paragraphs)
+        except Exception:
+            return ""
+    if name.endswith(".pdf"):
+        try:
+            import PyPDF2
+            reader = PyPDF2.PdfReader(BytesIO(body))
+            return "\n".join((p.extract_text() or "") for p in reader.pages)
+        except Exception:
+            return ""
     try: return body.decode("utf-8", errors="ignore")
     except Exception: return ""
 
-def _read_pdf(body: bytes) -> str:
-    try:
-        from PyPDF2 import PdfReader
-        reader = PdfReader(BytesIO(body))
-        return "\n".join((p.extract_text() or "") for p in reader.pages)
-    except Exception:
-        return ""
-
-def _read_docx(body: bytes) -> str:
-    try:
-        import docx
-        d = docx.Document(BytesIO(body))
-        return "\n".join(p.text for p in d.paragraphs)
-    except Exception:
-        return ""
-
-def _read_csv(body: bytes) -> str:
-    try:
-        txt = body.decode("utf-8", errors="ignore")
-        return "\n".join(txt.splitlines()[:200])
-    except Exception:
-        return ""
-
-def _read_xlsx(body: bytes) -> str:
-    try:
-        from openpyxl import load_workbook
-        wb = load_workbook(filename=BytesIO(body), data_only=True)
-        out: List[str] = []
-        for ws in wb.worksheets[:2]:
-            out.append(f"# Sheet: {ws.title}")
-            for i, row in enumerate(ws.iter_rows(values_only=True), start=1):
-                if i > 200: break
-                cells = ["" if c is None else str(c) for c in row]
-                out.append(",".join(cells))
-        return "\n".join(out)
-    except Exception:
-        return ""
-
-async def _extract_text(file: Optional[UploadFile]) -> str:
-    if not file: return ""
-    body = await file.read()
-    name = (file.filename or "").lower()
-    if name.endswith(".pdf"):  return _read_pdf(body)
-    if name.endswith(".docx"): return _read_docx(body)
-    if name.endswith(".xlsx"): return _read_xlsx(body)
-    if name.endswith(".csv"):  return _read_csv(body)
-    return _read_txt(body)
-
-def _call_openai_chat(prompt: str) -> str:
-    key = os.getenv("OPENAI_API_KEY")
-    if not key:
-        raise RuntimeError("OPENAI_API_KEY missing")
-    try:
-        import openai
-        if hasattr(openai, "OpenAI"):
-            client = openai.OpenAI(api_key=key, organization=os.getenv("OPENAI_ORG"), project=os.getenv("OPENAI_PROJECT"))
-            r = client.chat.completions.create(model="gpt-4o-mini", messages=[{"role": "user", "content": prompt}], temperature=0.2)
-            return r.choices[0].message.content
-        else:
-            openai.api_key = key
-            if os.getenv("OPENAI_ORG"): openai.organization = os.getenv("OPENAI_ORG")
-            r = openai.chat.completions.create(model="gpt-4o-mini", messages=[{"role": "user", "content": prompt}], temperature=0.2)
-            return r.choices[0].message.content
-    except Exception:
-        import requests
-        headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
-        if os.getenv("OPENAI_ORG"): headers["OpenAI-Organization"] = os.getenv("OPENAI_ORG")
-        if os.getenv("OPENAI_PROJECT"): headers["OpenAI-Project"] = os.getenv("OPENAI_PROJECT")
-        data = {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": prompt}], "temperature": 0.2}
-        resp = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, data=json.dumps(data), timeout=60)
-        if resp.status_code >= 400:
-            raise RuntimeError(f"OpenAI {resp.status_code}: {resp.text}")
-        return resp.json()["choices"][0]["message"]["content"]
-
-def _call_openrouter_chat(prompt: str) -> str:
-    key = os.getenv("OPENROUTER_API_KEY")
-    if not key:
-        raise RuntimeError("OPENROUTER_API_KEY missing")
-    import requests
-    headers = {
-        "Authorization": f"Bearer {key}",
-        "HTTP-Referer": "https://caio-frontend.vercel.app",
-        "X-Title": "CAIO",
-        "Content-Type": "application/json",
-    }
-    payload = {"model": "openai/gpt-4o-mini", "messages": [{"role": "user", "content": prompt}], "temperature": 0.2}
-    r = requests.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, data=json.dumps(payload), timeout=60)
-    if r.status_code >= 400:
-        raise RuntimeError(f"OpenRouter {r.status_code}: {r.text}")
-    return r.json()["choices"][0]["message"]["content"]
-
-def _pick_provider(is_paid: bool) -> List[str]:
-    raw = os.getenv("LLM_PROVIDER_PRO" if is_paid else "LLM_PROVIDER_DEMO", "openai,openrouter" if is_paid else "openrouter")
-    providers = [p.strip().lower() for p in raw.split(",") if p.strip()]
-    available: List[str] = []
-    if "openai" in providers and os.getenv("OPENAI_API_KEY"): available.append("openai")
-    if "openrouter" in providers and os.getenv("OPENROUTER_API_KEY"): available.append("openrouter")
-    return available or []
-
+# ------------------------------------------------------------------------------
+# Analyze (stub content; your engine plugs in here)
+# ------------------------------------------------------------------------------
 @app.post("/api/analyze")
 async def analyze(
     request: Request,
     file: Optional[UploadFile] = File(None),
     text: Optional[str] = Form(None),
     brains: Optional[str] = Form(None),
-    current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
-    if not getattr(current_user, "is_paid", False):
-        chosen = _choose_brains(brains, is_paid=False)
-        return JSONResponse(
-            {
-                "status": "demo",
-                "title": f"Demo Mode · {', '.join(chosen)}",
-                "summary": (
-                    "This is a demo preview. Upgrade to Pro to run all brains with real analysis.\n"
-                    f"Brains used: {', '.join(chosen)}"
-                ),
-                "tip": "Upload a business document or provide a brief to see the flow.",
-            },
-            status_code=200,
-        )
+    _check_and_increment_usage(db, current_user, endpoint="analyze")
+    extracted = (text or "").strip() or (await _read_upload_as_text(file)).strip() if file else (text or "").strip()
+    if not extracted:
+        raise HTTPException(status_code=400, detail="No input provided.")
+    chosen = [s.strip().upper() for s in (brains or "CFO,COO,CMO,CHRO").split(",") if s.strip()]
+    chosen = [b for b in chosen if b in {"CFO","COO","CMO","CHRO","CPO"}] or ["CFO","COO","CMO","CHRO"]
 
-    try:
-        extracted = await _extract_text(file)
-    except Exception as e:
-        logger.error("Extraction failed: %s\n%s", e, traceback.format_exc())
-        extracted = ""
-    brief = (text or "").strip()
-    chosen = _choose_brains(brains, is_paid=True)
-
-    if not extracted and not brief:
-        raise HTTPException(status_code=400, detail="Please upload a file or provide text")
-
-    prompts = {b: _brain_prompt(brief, extracted, b) for b in chosen}
-    provider_chain = _pick_provider(is_paid=True)
-
-    summaries: Dict[str, str] = {}
-    used_provider = "stub"
-    errs: List[str] = []
-
-    if provider_chain:
-        for p in provider_chain:
-            try:
-                if p == "openai":
-                    for b, pr in prompts.items(): summaries[b] = _call_openai_chat(pr)
-                elif p == "openrouter":
-                    for b, pr in prompts.items(): summaries[b] = _call_openrouter_chat(pr)
-                used_provider = p
-                break
-            except Exception as e:
-                logger.error("Provider %s failed: %s", p, e); errs.append(f"{p}:{e.__class__.__name__}"); summaries = {}; continue
-
-    if not summaries:
-        for b in prompts.keys():
-            summaries[b] = f"[Stub after error] {b} analysis. Errors: {', '.join(errs) if errs else 'no-provider'}."
-
-    combined = [f"### {b}\n{summaries[b]}" for b in chosen]
-    return {"status": "ok", "title": f"Analysis Complete · {', '.join(chosen)}", "summary": "\n\n".join(combined), "meta": {"provider": used_provider, "brains": chosen, "chars": len(extracted)}}
+    # simple, deterministic stub
+    sections = []
+    for b in chosen:
+        if b == "CFO":
+            sections.append("### CFO\nInsights\n- Cash runway and collections need tight monitoring.\n- Discretionary spend should be gated by ROI.\nRecommendations\n- **Tighten AR**: Shorten DSO by revising payment terms.\n- **Budget guardrails**: Freeze low-ROI lines.\n- **Forecast weekly**: Update a rolling 13-week CF.")
+        elif b == "COO":
+            sections.append("### COO\nInsights\n- Bottlenecks in handoffs reduce throughput.\n- SOP variance is high across teams.\nRecommendations\n- **Map bottlenecks**: Add checkpoints.\n- **Automate repeatables**: RPA where volume is high.\n- **QA cadence**: Weekly audits.")
+        elif b == "CMO":
+            sections.append("### CMO\nInsights\n- CAC:LTV has room to improve.\n- Under-invested in compounding channels.\nRecommendations\n- **Double down**: On channels with proven lift.\n- **Weekly experiments**: 3–5 tests with clear readouts.\n- **Retention**: Shore up lifecycle journeys.")
+        elif b == "CHRO":
+            sections.append("### CHRO\nInsights\n- Engagement pockets are uneven.\n- Attrition risk in key pods.\nRecommendations\n- **Manager 1:1s**: Reinforce feedback loops.\n- **Retention plans**: For high-impact roles.\n- **Mentor ladder**: Pair seniors to coach.")
+        elif b == "CPO":
+            sections.append("### CPO\nInsights\n- Roadmap prioritization unclear.\n- Voice of customer feedback underused.\nRecommendations\n- **RICE scoring**: Standardize prioritization.\n- **VOC loops**: Close feedback-to-roadmap gap.\n- **Ship cadence**: Smaller, faster iterations.")
+    summary = "\n\n".join(sections)
+    return {"status":"ok","title":f"Analysis Complete · {', '.join(chosen)}","summary":summary,"provider":"stub","brains":chosen,"chars":len(extracted)}
 
 # ------------------------------------------------------------------------------
-# Debug helpers (unchanged)
+# Markdown → structured sections
 # ------------------------------------------------------------------------------
-@app.get("/api/debug/ping-db")
-def ping_db(db: Session = Depends(get_db)):
-    try:
-        count = db.query(User).count()
-        u = db.query(User).first()
-        fields = []
-        if u:
-            for k in ("email", "hashed_password", "is_admin", "is_paid", "created_at"):
-                fields.append(f"{k}={'Y' if hasattr(u, k) else 'N'}")
-        return {"ok": True, "user_count": count, "user_fields": ", ".join(fields)}
-    except Exception as e:
-        logger.error("DB ping error: %s\n%s", e, traceback.format_exc())
-        if DEBUG:
-            return JSONResponse({"ok": False, "detail": str(e)}, status_code=500)
-        raise HTTPException(status_code=500, detail="DB error")
+def _parse_sections(md_text: str) -> Dict[str, Dict[str, List[str]]]:
+    """
+    Parse markdown into {brain: {insights:[], recs:[]}}
+    Recognizes:
+      - Headings: "### CFO" (any brain token)
+      - Subheads: "Insights" / "Recommendations" (case-insensitive)
+      - Bullets: "- text" or "1. text"
+      - "**Title**: details" pattern for bold title
+    """
+    data: Dict[str, Dict[str, List[str]]] = {}
+    brain: Optional[str] = None
+    mode: Optional[str] = None  # 'insights'|'recs'
+    for raw in md_text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("### "):
+            brain = line[4:].strip().upper()
+            if brain not in data:
+                data[brain] = {"insights": [], "recs": []}
+            mode = None
+            continue
+        low = line.lower()
+        if low == "insights":
+            mode = "insights"; continue
+        if low.startswith("recommendation"):
+            mode = "recs"; continue
+        if brain and mode in ("insights","recs"):
+            # normalize bullets/numbers
+            item = re.sub(r"^(\d+\.|\-|\•)\s*", "", line).strip()
+            data[brain]["insights" if mode=="insights" else "recs"].append(item)
+    return data
 
-@app.get("/api/debug/user-sample")
-def user_sample(db: Session = Depends(get_db)):
-    try:
-        u = db.query(User).first()
-        if not u: return {"sample": None}
-        return {
-            "email": getattr(u, "email", None),
-            "has_hashed_password": hasattr(u, "hashed_password"),
-            "is_admin": getattr(u, "is_admin", None),
-            "is_paid": getattr(u, "is_paid", None),
-        }
-    except Exception as e:
-        logger.error("User sample error: %s\n%s", e, traceback.format_exc())
-        if DEBUG: return JSONResponse({"detail": str(e)}, status_code=500)
-        raise HTTPException(status_code=500, detail="DB error")
-
-@app.get("/api/debug/routers")
-def debug_routers():
-    out = []
-    for r in app.routes:
-        methods = sorted(list(getattr(r, "methods", [])))
-        path = getattr(r, "path", "")
-        if path.startswith("/api/"):
-            out.append({"path": path, "methods": methods})
+def _collective_insights(struct: Dict[str, Dict[str, List[str]]], top_per_brain: int = 1) -> List[str]:
+    out: List[str] = []
+    for b in PREFERRED_ORDER:
+        if b in struct and struct[b]["insights"]:
+            out.extend(struct[b]["insights"][:top_per_brain])
+    # Include any other brains not in preferred order
+    for b, v in struct.items():
+        if b not in PREFERRED_ORDER and v["insights"]:
+            out.extend(v["insights"][:top_per_brain])
     return out
 
-# ------------------------------------------------------------------------------
-# Other routers
-# ------------------------------------------------------------------------------
-try:
-    from routes_public_config import router as public_cfg_router
-    app.include_router(public_cfg_router)  # /api/public-config
-except Exception as e:
-    logger.warning(f"routes_public_config not loaded: {e}")
-
-# Payments router (Razorpay)
-from payment_routes import router as payments_router   # live routes from payment_routes.py
-app.include_router(payments_router)                    # prefix defined in that module
-logger.info("✅ payments_router mounted")
-# (You already mounted this in your current main.py; keeping it intact.)  # :contentReference[oaicite:5]{index=5}
-
-try:
-    from contact_routes import router as contact_router
-    app.include_router(contact_router)  # /api/contact
-except Exception as e:
-    logger.warning(f"contact_routes not loaded: {e}")
-
-try:
-    from admin_bootstrap import router as admin_bootstrap_router
-    app.include_router(admin_bootstrap_router)
-except Exception as e:
-    logger.warning(f"admin_bootstrap not loaded: {e}")
-
-try:
-    from maintenance_routes import router as maintenance_router
-    app.include_router(maintenance_router)
-except Exception as e:
-    logger.warning(f"maintenance_routes not loaded: {e}")
+def _split_bold_title(text: str) -> Tuple[Optional[str], str]:
+    """
+    Parse '**Title**: rest' or '**Title** – rest' → (Title, rest)
+    Returns (None, text) if no bold pattern found.
+    """
+    m = re.match(r"^\*\*(.+?)\*\*\s*[:\-–]\s*(.*)$", text)
+    if m:
+        title = m.group(1).strip()
+        rest = m.group(2).strip()
+        return (title or None, rest)
+    # Remove raw ** if present without colon
+    if "**" in text:
+        text = text.replace("**", "")
+    return (None, text)
 
 # ------------------------------------------------------------------------------
-# Exports (PRO only)
+# DOCX writer (Collective Insights first; then {BRAIN} Recommends)
 # ------------------------------------------------------------------------------
-from docx import Document
-from docx.shared import Pt
-from reportlab.lib.pagesizes import A4
-from reportlab.pdfgen import canvas
-from textwrap import wrap
-
-def _ensure_pro(current_user: User):
-    if not bool(getattr(current_user, "is_paid", False)):
-        raise HTTPException(status_code=403, detail="Export is available to Pro accounts only.")
-
-def _parse_analysis_md(md_text: str) -> list[tuple[str, str]]:
-    parts = []
-    current_brain = None
-    buf: List[str] = []
-    for line in md_text.splitlines():
-        if line.startswith("### "):
-            if current_brain:
-                parts.append((current_brain, "\n".join(buf).strip())); buf = []
-            current_brain = line.replace("###", "").strip()
-        else:
-            buf.append(line)
-    if current_brain:
-        parts.append((current_brain, "\n".join(buf).strip()))
-    return parts or [("Analysis", md_text)]
-
 def _write_docx(title: str, md_text: str) -> BytesIO:
+    struct = _parse_sections(md_text)
     doc = Document()
-    doc.styles['Normal'].font.name = 'Calibri'
-    doc.styles['Normal'].font.size = Pt(11)
-    doc.add_heading(title or "CAIO Analysis", level=1)
-    for brain, content in _parse_analysis_md(md_text):
-        doc.add_heading(brain, level=2)
-        for para in content.split("\n\n"):
-            p = para.strip()
-            if not p: continue
-            if p.startswith(("* ", "- ")):
-                for line in p.splitlines():
-                    if line.strip().startswith(("* ", "- ")):
-                        doc.add_paragraph(line.strip()[2:], style=None).style = None
-                        doc.paragraphs[-1].style = doc.styles['List Bullet']
-            elif p[0:2].isdigit() or p.startswith("1. "):
-                for line in p.splitlines():
-                    doc.add_paragraph(line.split(". ", 1)[-1], style=None)
-                    doc.paragraphs[-1].style = doc.styles['List Number']
+    h = doc.add_heading(title, level=1)
+    for run in h.runs:
+        run.font.size = Pt(16)
+
+    # Collective Insights
+    coll = _collective_insights(struct, top_per_brain=1)
+    if coll:
+        doc.add_heading("Collective Insights", level=2)
+        for idx, item in enumerate(coll, 1):
+            t, rest = _split_bold_title(item)
+            p = doc.add_paragraph(style="List Number")
+            if t:
+                r1 = p.add_run(f"{t}")
+                r1.bold = True
+                if rest:
+                    p.add_run(f": {rest}")
             else:
-                doc.add_paragraph(p)
+                p.add_run(item)
+
+    # Recommendations per brain (preferred order)
+    for brain in PREFERRED_ORDER + [b for b in struct.keys() if b not in PREFERRED_ORDER]:
+        recs = struct.get(brain, {}).get("recs", [])
+        if not recs:
+            continue
+        doc.add_heading(f"{brain} Recommends", level=2)
+        for idx, item in enumerate(recs, 1):
+            t, rest = _split_bold_title(item)
+            p = doc.add_paragraph(style="List Number")
+            if t:
+                r1 = p.add_run(f"{t}")
+                r1.bold = True
+                if rest:
+                    p.add_run(f": {rest}")
+            else:
+                p.add_run(item)
+
     bio = BytesIO(); doc.save(bio); bio.seek(0); return bio
 
+# ------------------------------------------------------------------------------
+# PDF writer (mirrors DOCX layout)
+# ------------------------------------------------------------------------------
 def _write_pdf(title: str, md_text: str) -> BytesIO:
+    struct = _parse_sections(md_text)
     bio = BytesIO()
     c = canvas.Canvas(bio, pagesize=A4)
     width, height = A4
-    left, top = 50, height - 50
+    left, right, top, bottom = 50, width - 50, height - 50, 50
     y = top
 
-    def draw_line(text, bold=False):
+    def new_page():
         nonlocal y
-        if y < 60:
-            c.showPage(); y = top
-        if bold: c.setFont("Helvetica-Bold", 12)
-        else:    c.setFont("Helvetica", 11)
-        for wrapped in wrap(text, width=90):
-            c.drawString(left, y, wrapped); y -= 16
+        c.showPage()
+        y = top
 
-    draw_line(title or "CAIO Analysis", bold=True); y -= 10
-    for brain, content in _parse_analysis_md(md_text):
-        draw_line(brain, bold=True)
-        for para in content.split("\n\n"):
-            if para.strip():
-                for line in para.splitlines():
-                    draw_line(line.strip())
-        y -= 8
+    def draw_para(text: str, bold: bool = False, indent: int = 0, leading: int = 14, wrap_at: int = 100):
+        nonlocal y
+        if bold: c.setFont("Helvetica-Bold", 12)
+        else: c.setFont("Helvetica", 11)
+        for ln in wrap(text, wrap_at):
+            if y < bottom: new_page()
+            c.drawString(left + indent, y, ln)
+            y -= leading
+
+    # Title
+    c.setFont("Helvetica-Bold", 14)
+    for ln in wrap(title, 80):
+        if y < bottom: new_page()
+        c.drawString(left, y, ln); y -= 18
+
+    # Collective Insights
+    coll = _collective_insights(struct, top_per_brain=1)
+    if coll:
+        draw_para("Collective Insights", bold=True, wrap_at=85)
+        for i, item in enumerate(coll, 1):
+            t, rest = _split_bold_title(item)
+            # "1. " prefix; bold title then normal rest
+            prefix = f"{i}. "
+            if y < bottom: new_page()
+            c.setFont("Helvetica", 11)
+            c.drawString(left, y, prefix);  # prefix
+            x_offset = left + 20
+            if t:
+                c.setFont("Helvetica-Bold", 11)
+                c.drawString(x_offset, y, t)
+                x_offset += 7 * len(t) / 2  # rough offset; subsequent lines wrap as normal
+                if rest:
+                    c.setFont("Helvetica", 11)
+                    c.drawString(x_offset, y, f": {rest}")
+            else:
+                c.setFont("Helvetica", 11)
+                c.drawString(x_offset, y, item)
+            y -= 14
+
+    # Recommendations per brain
+    for brain in PREFERRED_ORDER + [b for b in struct.keys() if b not in PREFERRED_ORDER]:
+        recs = struct.get(brain, {}).get("recs", [])
+        if not recs: continue
+        draw_para(f"{brain} Recommends", bold=True, wrap_at=85)
+        for i, item in enumerate(recs, 1):
+            t, rest = _split_bold_title(item)
+            prefix = f"{i}. "
+            if y < bottom: new_page()
+            c.setFont("Helvetica", 11)
+            c.drawString(left, y, prefix)
+            x_offset = left + 20
+            if t:
+                c.setFont("Helvetica-Bold", 11)
+                c.drawString(x_offset, y, t)
+                x_offset += 7 * len(t) / 2
+                if rest:
+                    c.setFont("Helvetica", 11)
+                    c.drawString(x_offset, y, f": {rest}")
+            else:
+                c.setFont("Helvetica", 11)
+                c.drawString(x_offset, y, item)
+            y -= 14
 
     c.save(); bio.seek(0); return bio
 
-@app.post("/api/export/docx")
+# ------------------------------------------------------------------------------
+# Export endpoints (POST + GET; /word alias)
+# ------------------------------------------------------------------------------
+def _extract_export_content(payload: Optional[dict], title_q: Optional[str], md_q: Optional[str], md_text_q: Optional[str]):
+    title = (payload.get("title") if payload else None) or (title_q or "CAIO Analysis")
+    md_text = ((payload.get("md_text") if payload else None) or (payload.get("markdown") if payload else None) or md_text_q or md_q or "").strip()
+    return title.strip(), md_text
+
+@app.api_route("/api/export/docx", methods=["POST", "GET"])
 def export_docx(
-    title: Optional[str] = Body(None),
-    md_text: str = Body(..., embed=True),
+    request: Request,
+    payload: Optional[dict] = Body(None),
+    title: Optional[str] = Query(None),
+    md: Optional[str] = Query(None),
+    md_text: Optional[str] = Query(None),
     current_user: User = Depends(get_current_user),
 ):
     _ensure_pro(current_user)
-    bio = _write_docx(title or "CAIO Analysis", md_text)
-    headers = {"Content-Disposition": 'attachment; filename="caio-analysis.docx"'}
+    t, content = _extract_export_content(payload, title, md, md_text)
+    if not content: raise HTTPException(status_code=400, detail="No content to export.")
+    bio = _write_docx(t, content)
+    headers = {"Content-Disposition": f'attachment; filename="{t.replace(" ", "_").lower()}.docx"'}
     return StreamingResponse(bio, headers=headers, media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
 
-@app.post("/api/export/pdf")
+@app.api_route("/api/export/word", methods=["POST", "GET"])
+def export_word(
+    request: Request,
+    payload: Optional[dict] = Body(None),
+    title: Optional[str] = Query(None),
+    md: Optional[str] = Query(None),
+    md_text: Optional[str] = Query(None),
+    current_user: User = Depends(get_current_user),
+):
+    return export_docx(request, payload, title, md, md_text, current_user)
+
+@app.api_route("/api/export/pdf", methods=["POST", "GET"])
 def export_pdf(
-    title: Optional[str] = Body(None),
-    md_text: str = Body(..., embed=True),
+    request: Request,
+    payload: Optional[dict] = Body(None),
+    title: Optional[str] = Query(None),
+    md: Optional[str] = Query(None),
+    md_text: Optional[str] = Query(None),
     current_user: User = Depends(get_current_user),
 ):
     _ensure_pro(current_user)
-    bio = _write_pdf(title or "CAIO Analysis", md_text)
-    headers = {"Content-Disposition": 'attachment; filename="caio-analysis.pdf"'}
+    t, content = _extract_export_content(payload, title, md, md_text)
+    if not content: raise HTTPException(status_code=400, detail="No content to export.")
+    bio = _write_pdf(t, content)
+    headers = {"Content-Disposition": f'attachment; filename="{t.replace(" ", "_").lower()}.pdf"'}
     return StreamingResponse(bio, headers=headers, media_type="application/pdf")
