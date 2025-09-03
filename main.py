@@ -1,13 +1,12 @@
 # main.py
 import os
-import logging
 from typing import Optional, List
 from datetime import datetime
 from io import BytesIO
 from textwrap import wrap
 
 from fastapi import (
-    FastAPI, Depends, HTTPException, UploadFile, File, Form, Request, Body
+    FastAPI, Depends, HTTPException, UploadFile, File, Form, Request, Body, Query
 )
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -16,8 +15,8 @@ from sqlalchemy.orm import Session
 
 from db import get_db, User, init_db, UsageLog
 from auth import create_access_token, verify_password, get_password_hash, get_current_user
-from payment_routes import router as payments_router  # keep your existing payments routes
-from routes_public_config import router as public_config_router  # public pricing/config
+from payment_routes import router as payments_router
+from routes_public_config import router as public_config_router
 
 # Export libs
 from docx import Document
@@ -44,7 +43,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Mount routers
+# Routers
 app.include_router(payments_router)
 app.include_router(public_config_router)
 
@@ -52,7 +51,7 @@ app.include_router(public_config_router)
 init_db()
 
 # ------------------------------------------------------------------------------
-# Utility: CORS preflight (OPTIONS /*)
+# CORS preflight
 # ------------------------------------------------------------------------------
 @app.options("/{path:path}")
 def cors_preflight(path: str):
@@ -70,7 +69,7 @@ def ready():
     return {"ready": True}
 
 # ------------------------------------------------------------------------------
-# Auth: signup/login minimal helpers (unchanged contracts)
+# Auth: signup/login/profile
 # ------------------------------------------------------------------------------
 @app.post("/api/signup")
 def signup(
@@ -138,15 +137,9 @@ def _today_range_utc():
     return start, end
 
 def _check_and_increment_usage(db: Session, user: User, endpoint: str = "analyze"):
-    # Pro users bypass limits
     if bool(getattr(user, "is_paid", False)):
-        log = UsageLog(
-            user_id=getattr(user, "id", 0) or 0,
-            timestamp=datetime.utcnow(),
-            endpoint=endpoint,
-            status="ok",
-        )
-        db.add(log)
+        db.add(UsageLog(user_id=getattr(user, "id", 0) or 0,
+                        timestamp=datetime.utcnow(), endpoint=endpoint, status="ok"))
         db.commit()
         return
 
@@ -164,24 +157,17 @@ def _check_and_increment_usage(db: Session, user: User, endpoint: str = "analyze
             status_code=429,
             detail="Daily free limit reached. Upgrade to Pro for unlimited analyses.",
         )
-    # increment
-    log = UsageLog(
-        user_id=getattr(user, "id", 0) or 0,
-        timestamp=datetime.utcnow(),
-        endpoint=endpoint,
-        status="ok",
-    )
-    db.add(log)
+
+    db.add(UsageLog(user_id=getattr(user, "id", 0) or 0,
+                    timestamp=datetime.utcnow(), endpoint=endpoint, status="ok"))
     db.commit()
 
 def _ensure_pro(current_user: User):
     if not bool(getattr(current_user, "is_paid", False)):
-        raise HTTPException(
-            status_code=403, detail="Export is available to Pro accounts only."
-        )
+        raise HTTPException(status_code=403, detail="Export is available to Pro accounts only.")
 
 # ------------------------------------------------------------------------------
-# File readers (lightweight, safe)
+# File readers (lightweight)
 # ------------------------------------------------------------------------------
 async def _read_upload_as_text(up: UploadFile) -> str:
     if not up:
@@ -189,10 +175,7 @@ async def _read_upload_as_text(up: UploadFile) -> str:
     body = await up.read()
     name = (up.filename or "").lower()
 
-    if name.endswith(".txt") or name.endswith(".md"):
-        return body.decode("utf-8", errors="ignore")
-
-    if name.endswith(".csv") or name.endswith(".tsv"):
+    if name.endswith((".txt", ".md", ".csv", ".tsv")):
         try:
             return body.decode("utf-8", errors="ignore")
         except Exception:
@@ -214,7 +197,6 @@ async def _read_upload_as_text(up: UploadFile) -> str:
         except Exception:
             return ""
 
-    # Fallback attempt as utf-8
     try:
         return body.decode("utf-8", errors="ignore")
     except Exception:
@@ -228,11 +210,10 @@ async def analyze(
     request: Request,
     file: Optional[UploadFile] = File(None),
     text: Optional[str] = Form(None),
-    brains: Optional[str] = Form(None),  # e.g. "CFO,COO,CMO,CHRO"
+    brains: Optional[str] = Form(None),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    # Enforce usage limits first
     _check_and_increment_usage(db, current_user, endpoint="analyze")
 
     extracted = ""
@@ -244,7 +225,6 @@ async def analyze(
     if not extracted:
         raise HTTPException(status_code=400, detail="No input provided.")
 
-    # Minimal deterministic stub (replace with your engine/orchestration)
     selected = [s.strip().upper() for s in (brains or "CFO,COO,CMO,CHRO").split(",") if s.strip()]
     selected = [b for b in selected if b in {"CFO", "COO", "CMO", "CHRO"}] or ["CFO","COO","CMO","CHRO"]
 
@@ -275,125 +255,121 @@ async def analyze(
 # ------------------------------------------------------------------------------
 def _write_docx(title: str, md_text: str) -> BytesIO:
     doc = Document()
-    # Title
     h = doc.add_heading(title, level=1)
-    for run in h.runs:
-        run.font.size = Pt(16)
+    for run in h.runs: run.font.size = Pt(16)
 
-    # Very simple markdown-ish rendering: headings & bullets
     for line in md_text.splitlines():
         line = line.rstrip()
         if not line.strip():
-            doc.add_paragraph("")
-            continue
+            doc.add_paragraph(""); continue
         if line.startswith("### "):
             p = doc.add_paragraph()
-            run = p.add_run(line[4:].strip())
-            run.bold = True
-            run.font.size = Pt(12)
-            continue
+            r = p.add_run(line[4:].strip()); r.bold = True; r.font.size = Pt(12); continue
         if line.startswith("- "):
             p = doc.add_paragraph(line[2:].strip())
-            p.style = doc.styles["List Bullet"]
-            continue
+            p.style = doc.styles["List Bullet"]; continue
         doc.add_paragraph(line)
 
-    bio = BytesIO()
-    doc.save(bio)
-    bio.seek(0)
-    return bio
+    bio = BytesIO(); doc.save(bio); bio.seek(0); return bio
 
 def _write_pdf(title: str, md_text: str) -> BytesIO:
-    bio = BytesIO()
-    c = canvas.Canvas(bio, pagesize=A4)
-    width, height = A4
-    left, right, top, bottom = 50, width - 50, height - 50, 50
-    y = top
-
+    bio = BytesIO(); c = canvas.Canvas(bio, pagesize=A4)
+    width, height = A4; left, right, top, bottom = 50, width-50, height-50, 50; y = top
     def new_page():
-        nonlocal y
-        c.showPage()
-        y = top
+        nonlocal y; c.showPage(); y = top
 
-    # Title
     c.setFont("Helvetica-Bold", 14)
-    for line in wrap(title, 80):
+    for ln in wrap(title, 80):
         if y < bottom: new_page()
-        c.drawString(left, y, line)
-        y -= 18
+        c.drawString(left, y, ln); y -= 18
 
     c.setFont("Helvetica", 11)
     for raw in md_text.splitlines():
         txt = raw.rstrip()
         if not txt:
-            y -= 8
-            if y < bottom: new_page()
+            y -= 8; 
+            if y < bottom: new_page(); 
             continue
-
-        # Headings
         if txt.startswith("### "):
             c.setFont("Helvetica-Bold", 12)
-            content = txt[4:].strip()
-            lines = wrap(content, 85)
-            for ln in lines:
+            for ln in wrap(txt[4:].strip(), 85):
                 if y < bottom: new_page()
-                c.drawString(left, y, ln)
-                y -= 16
-            c.setFont("Helvetica", 11)
-            continue
-
-        # Bullets
+                c.drawString(left, y, ln); y -= 16
+            c.setFont("Helvetica", 11); continue
         if txt.startswith("- "):
-            bullet = u"• " + txt[2:].strip()
-            lines = wrap(bullet, 95)
-            for ln in lines:
+            for ln in wrap("• " + txt[2:].strip(), 95):
                 if y < bottom: new_page()
-                c.drawString(left + 10, y, ln)
-                y -= 14
+                c.drawString(left + 10, y, ln); y -= 14
             continue
-
-        # Normal paragraph
-        lines = wrap(txt, 100)
-        for ln in lines:
+        for ln in wrap(txt, 100):
             if y < bottom: new_page()
-            c.drawString(left, y, ln)
-            y -= 14
+            c.drawString(left, y, ln); y -= 14
 
-    c.save()
-    bio.seek(0)
-    return bio
+    c.save(); bio.seek(0); return bio
 
 # ------------------------------------------------------------------------------
-# Export endpoints (Pro only)
+# Export endpoints (Pro only) — support POST and GET; add /word alias
 # ------------------------------------------------------------------------------
-@app.post("/api/export/docx")
+def _extract_export_content(
+    payload: Optional[dict],
+    title_q: Optional[str],
+    md_q: Optional[str],
+    md_text_q: Optional[str],
+):
+    title = (payload.get("title") if payload else None) or (title_q or "CAIO Analysis")
+    md_text = (
+        (payload.get("md_text") if payload else None)
+        or (payload.get("markdown") if payload else None)
+        or md_text_q or md_q or ""
+    )
+    return title.strip(), md_text
+
+@app.api_route("/api/export/docx", methods=["POST", "GET"])
 def export_docx(
-    payload: dict = Body(...),
+    request: Request,
+    payload: Optional[dict] = Body(None),
+    title: Optional[str] = Query(None),
+    md: Optional[str] = Query(None),
+    md_text: Optional[str] = Query(None),
     current_user: User = Depends(get_current_user),
 ):
     _ensure_pro(current_user)
-    title = (payload.get("title") or "CAIO Analysis").strip()
-    md_text = payload.get("md_text") or payload.get("markdown") or ""
-    if not md_text.strip():
+    t, content = _extract_export_content(payload, title, md, md_text)
+    if not content.strip():
         raise HTTPException(status_code=400, detail="No content to export.")
-    bio = _write_docx(title, md_text)
-    headers = {"Content-Disposition": f'attachment; filename="{title.replace(" ", "_").lower()}.docx"'}
+    bio = _write_docx(t, content)
+    headers = {"Content-Disposition": f'attachment; filename="{t.replace(" ", "_").lower()}.docx"'}
     return StreamingResponse(
         bio,
         headers=headers,
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     )
 
-@app.post("/api/export/pdf")
+# alias for Word
+@app.api_route("/api/export/word", methods=["POST", "GET"])
+def export_word(
+    request: Request,
+    payload: Optional[dict] = Body(None),
+    title: Optional[str] = Query(None),
+    md: Optional[str] = Query(None),
+    md_text: Optional[str] = Query(None),
+    current_user: User = Depends(get_current_user),
+):
+    return export_docx(request, payload, title, md, md_text, current_user)  # reuse
+
+@app.api_route("/api/export/pdf", methods=["POST", "GET"])
 def export_pdf(
-    payload: dict = Body(...),
+    request: Request,
+    payload: Optional[dict] = Body(None),
+    title: Optional[str] = Query(None),
+    md: Optional[str] = Query(None),
+    md_text: Optional[str] = Query(None),
     current_user: User = Depends(get_current_user),
 ):
     _ensure_pro(current_user)
-    title = (payload.get("title") or "CAIO Analysis").strip()
-    md_text = payload.get("md_text") or payload.get("markdown") or ""
-    if not md_text.strip():
+    t, content = _extract_export_content(payload, title, md, md_text)
+    if not content.strip():
         raise HTTPException(status_code=400, detail="No content to export.")
-    bio = _write_pdf(title, md_text)
-    headers = {"Content-Disposition": f'attachment; filename="{title.replace(" ", "_").lower()}.pdf"'}
+    bio = _write_pdf(t, content)
+    headers = {"Content-Disposition": f'attachment; filename="{t.replace(" ", "_").lower()}.pdf"'}
     return StreamingResponse(bio, headers=headers, media_type="application/pdf")
