@@ -1,16 +1,16 @@
 # main.py
 import os, logging, traceback, json
-from typing import Optional, List, Dict
+from typing import Optional, List, Tuple
 from datetime import datetime
 from io import BytesIO
 
-from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Request, Body
-from fastapi.responses import JSONResponse  # StreamingResponse removed
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Request
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
 
-from db import get_db, User, init_db
+from db import get_db, User, init_db, UsageLog
 from auth import create_access_token, verify_password, get_password_hash, get_current_user
 
 # --------------------------------------------------------------------------
@@ -21,9 +21,9 @@ logger = logging.getLogger("caio")
 
 DEBUG = os.getenv("DEBUG", "0") in ("1", "true", "TRUE", "yes", "YES")
 
-app = FastAPI(title="CAIO Backend", version="0.1.0")
+app = FastAPI(title="CAIO Backend", version="0.2.0")
 
-# Ensure tables exist
+# Ensure tables exist (includes usage_logs)
 init_db()
 
 # --------------------------------------------------------------------------
@@ -58,7 +58,7 @@ def cors_preflight(path: str):
 # --------------------------------------------------------------------------
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "version": "0.1.0"}
+    return {"status": "ok", "version": "0.2.0"}
 
 @app.get("/api/ready")
 def ready():
@@ -72,6 +72,16 @@ ADMIN_EMAILS = {
     for e in os.getenv("ADMIN_EMAILS", "vineetpjoshi.71@gmail.com").split(",")
     if e.strip()
 }
+
+# Optional hook (not used unless set). If you later want premium unlimited:
+PREMIUM_EMAILS = {
+    e.strip().lower()
+    for e in os.getenv("PREMIUM_EMAILS", "").split(",")
+    if e.strip()
+}
+
+DEMO_DAILY_LIMIT = int(os.getenv("DEMO_DAILY_LIMIT", "5"))
+PRO_DAILY_LIMIT  = int(os.getenv("PRO_DAILY_LIMIT",  "50"))
 
 def _login_core(email: str, password: str, db: Session):
     if not email or not password:
@@ -124,7 +134,80 @@ def profile(current_user: User = Depends(get_current_user)):
         "is_admin": bool(getattr(current_user, "is_admin", False)),
         "is_paid": bool(getattr(current_user, "is_paid", False)),
         "created_at": getattr(current_user, "created_at", None),
+        "tier": "admin" if current_user.email.lower() in ADMIN_EMAILS
+                else ("premium" if current_user.email.lower() in PREMIUM_EMAILS
+                      else ("pro" if getattr(current_user, "is_paid", False) else "demo")),
     }
+
+# --------------------------------------------------------------------------
+# Usage limits
+# --------------------------------------------------------------------------
+def _user_tier(user: User) -> str:
+    email = (user.email or "").lower()
+    if email in ADMIN_EMAILS:
+        return "admin"
+    if email in PREMIUM_EMAILS:
+        return "premium"  # optional, only if env provided
+    return "pro" if bool(getattr(user, "is_paid", False)) else "demo"
+
+def _limit_for_tier(tier: str) -> Optional[int]:
+    if tier in ("admin", "premium"):
+        return None  # unlimited
+    return PRO_DAILY_LIMIT if tier == "pro" else DEMO_DAILY_LIMIT
+
+def _today_range_utc() -> Tuple[datetime, datetime]:
+    now = datetime.utcnow()
+    start = datetime(now.year, now.month, now.day)
+    end   = datetime(now.year, now.month, now.day, 23, 59, 59, 999999)
+    return start, end
+
+def _check_and_increment_usage(db: Session, user: User, endpoint: str = "analyze"):
+    """Returns (allowed, used, limit, reset_at_utc, tier). Increments on allow."""
+    tier = _user_tier(user)
+    limit = _limit_for_tier(tier)
+    start, end = _today_range_utc()
+
+    if limit is None:
+        # Unlimited: still log for observability
+        db.add(UsageLog(user_id=getattr(user, "id", 0) or 0, timestamp=datetime.utcnow(), endpoint=endpoint, status="ok"))
+        db.commit()
+        return True, 0, None, end, tier
+
+    used = (
+        db.query(UsageLog)
+        .filter(UsageLog.user_id == getattr(user, "id", 0))
+        .filter(UsageLog.endpoint == endpoint)
+        .filter(UsageLog.timestamp >= start)
+        .filter(UsageLog.timestamp <= end)
+        .count()
+    )
+
+    if used >= limit:
+        return False, used, limit, end, tier
+
+    # Reserve this request
+    db.add(UsageLog(user_id=getattr(user, "id", 0) or 0, timestamp=datetime.utcnow(), endpoint=endpoint, status="ok"))
+    db.commit()
+    return True, used + 1, limit, end, tier
+
+def _limit_response(used: int, limit: int, reset_at: datetime, tier: str):
+    pretty_plan = "Pro" if tier == "pro" else "Demo"
+    remaining = max(0, limit - used)
+    # Simple UTC reset time
+    reset_hhmm = reset_at.strftime("%H:%M")
+    return JSONResponse(
+        status_code=429,
+        content={
+            "status": "error",
+            "title": "Daily limit reached",
+            "message": f"You've used {used}/{limit} {pretty_plan} requests today. Resets at {reset_hhmm} UTC.",
+            "plan": tier,
+            "used": used,
+            "limit": limit,
+            "remaining": remaining,
+            "reset_at": reset_at.isoformat() + "Z",
+        },
+    )
 
 # --------------------------------------------------------------------------
 # File reading helpers
@@ -182,7 +265,7 @@ async def _extract_text(file: Optional[UploadFile]) -> str:
     return _read_txt(body)
 
 # --------------------------------------------------------------------------
-# Analyze (demo vs pro) — same as your original
+# Analyze (demo vs pro)
 # --------------------------------------------------------------------------
 DEFAULT_BRAINS_ORDER: List[str] = ["CFO", "COO", "CHRO", "CMO", "CPO"]
 
@@ -284,8 +367,13 @@ async def analyze(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    # Demo users: return preview (kept same)
-    if not getattr(current_user, "is_paid", False):
+    # Enforce daily caps (count both text and file uploads)
+    allowed, used, limit, reset_at, tier = _check_and_increment_usage(db, current_user, endpoint="analyze")
+    if not allowed:
+        return _limit_response(used, int(limit or 0), reset_at, tier)
+
+    # Demo flow returns preview (still counts above)
+    if tier == "demo":
         chosen = _choose_brains(brains, is_paid=False)
         return JSONResponse(
             {
@@ -300,6 +388,7 @@ async def analyze(
             status_code=200,
         )
 
+    # Pro/Admin (and optional Premium)
     try:
         extracted = await _extract_text(file)
     except Exception as e:
@@ -314,7 +403,7 @@ async def analyze(
     prompts = {b: _brain_prompt(brief, extracted, b) for b in chosen}
     provider_chain = _pick_provider(is_paid=True)
 
-    summaries: Dict[str, str] = {}
+    summaries = {}
     used_provider = "stub"
     errs: List[str] = []
 
@@ -361,22 +450,6 @@ def ping_db(db: Session = Depends(get_db)):
             return JSONResponse({"ok": False, "detail": str(e)}, status_code=500)
         raise HTTPException(status_code=500, detail="DB error")
 
-@app.get("/api/debug/user-sample")
-def user_sample(db: Session = Depends(get_db)):
-    try:
-        u = db.query(User).first()
-        if not u: return {"sample": None}
-        return {
-            "email": getattr(u, "email", None),
-            "has_hashed_password": hasattr(u, "hashed_password"),
-            "is_admin": getattr(u, "is_admin", None),
-            "is_paid": getattr(u, "is_paid", None),
-        }
-    except Exception as e:
-        logger.error("User sample error: %s\n%s", e, traceback.format_exc())
-        if DEBUG: return JSONResponse({"detail": str(e)}, status_code=500)
-        raise HTTPException(status_code=500, detail="DB error")
-
 @app.get("/api/debug/routers")
 def debug_routers():
     out = []
@@ -396,9 +469,12 @@ try:
 except Exception as e:
     logger.warning(f"routes_public_config not loaded: {e}")
 
-from payment_routes import router as payments_router
-app.include_router(payments_router)
-logger.info("✅ payments_router mounted")
+try:
+    from payment_routes import router as payments_router
+    app.include_router(payments_router)
+    logger.info("✅ payments_router mounted")
+except Exception as e:
+    logger.warning(f"payment_routes not loaded: {e}")
 
 try:
     from contact_routes import router as contact_router
