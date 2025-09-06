@@ -610,6 +610,155 @@ def admin_users(
         "top": out,
     }
 
+# ---------- Admin Users Roster (list & mutate) ----------
+from pydantic import BaseModel  # add at top if not present
+
+class SetPaidPayload(BaseModel):
+    email: str
+    is_paid: bool
+
+@app.get("/api/admin/users/roster")
+@app.get("/api/admin/users/roster/")  # accept trailing slash too
+def admin_users_roster(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=200),
+    q: Optional[str] = Query(None, description="search by email"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    _require_admin(current_user)
+
+    base = db.query(User)
+    if q:
+        like = f"%{q.lower()}%"
+        base = base.filter(func.lower(User.email).like(like))
+
+    total = base.count()
+    rows = (
+        base.order_by(User.created_at.desc() if hasattr(User, "created_at") else User.email.asc())
+            .offset((page - 1) * page_size)
+            .limit(page_size)
+            .all()
+    )
+
+    user_ids = [getattr(u, "id", 0) for u in rows if getattr(u, "id", 0)]
+    stats: dict[int, dict] = {}
+    if user_ids:
+        now = datetime.utcnow()
+        since1 = now - timedelta(days=1)
+        since7 = now - timedelta(days=7)
+
+        # last seen
+        last_rows = (
+            db.query(UsageLog.user_id, func.max(UsageLog.timestamp))
+              .filter(UsageLog.user_id.in_(user_ids))
+              .group_by(UsageLog.user_id)
+              .all()
+        )
+        for uid, last_ts in last_rows:
+            stats[int(uid)] = {"last_seen": (last_ts.isoformat() + "Z") if last_ts else None}
+
+        # 24h totals
+        r24 = (
+            db.query(UsageLog.user_id, func.count(UsageLog.id))
+              .filter(UsageLog.user_id.in_(user_ids), UsageLog.timestamp >= since1)
+              .group_by(UsageLog.user_id)
+              .all()
+        )
+        for uid, c in r24:
+            stats.setdefault(int(uid), {})["count_24h"] = int(c)
+
+        # 24h analyze
+        r24a = (
+            db.query(UsageLog.user_id, func.count(UsageLog.id))
+              .filter(
+                  UsageLog.user_id.in_(user_ids),
+                  UsageLog.timestamp >= since1,
+                  UsageLog.endpoint == "analyze",
+              )
+              .group_by(UsageLog.user_id)
+              .all()
+        )
+        for uid, c in r24a:
+            stats.setdefault(int(uid), {})["analyze_24h"] = int(c)
+
+        # 24h chat
+        r24c = (
+            db.query(UsageLog.user_id, func.count(UsageLog.id))
+              .filter(
+                  UsageLog.user_id.in_(user_ids),
+                  UsageLog.timestamp >= since1,
+                  UsageLog.endpoint == "chat",
+              )
+              .group_by(UsageLog.user_id)
+              .all()
+        )
+        for uid, c in r24c:
+            stats.setdefault(int(uid), {})["chat_24h"] = int(c)
+
+        # 7d total
+        r7 = (
+            db.query(UsageLog.user_id, func.count(UsageLog.id))
+              .filter(UsageLog.user_id.in_(user_ids), UsageLog.timestamp >= since7)
+              .group_by(UsageLog.user_id)
+              .all()
+        )
+        for uid, c in r7:
+            stats.setdefault(int(uid), {})["count_7d"] = int(c)
+
+    items = []
+    for u in rows:
+        email = (u.email or "").lower()
+        tier = "admin" if email in ADMIN_EMAILS else (
+            "premium" if email in PREMIUM_EMAILS else (
+                "pro" if bool(getattr(u, "is_paid", False)) else "demo"
+            )
+        )
+        s = stats.get(getattr(u, "id", 0), {})
+        created = getattr(u, "created_at", None)
+        items.append({
+            "email": u.email,
+            "tier": tier,
+            "is_admin": bool(email in ADMIN_EMAILS or getattr(u, "is_admin", False)),
+            "is_paid": bool(getattr(u, "is_paid", False) or email in ADMIN_EMAILS or email in PREMIUM_EMAILS),
+            "managed": "env" if (email in ADMIN_EMAILS or email in PREMIUM_EMAILS) else "db",
+            "created_at": created.isoformat() + "Z" if created else None,
+            "last_seen": s.get("last_seen"),
+            "count_24h": s.get("count_24h", 0),
+            "analyze_24h": s.get("analyze_24h", 0),
+            "chat_24h": s.get("chat_24h", 0),
+            "count_7d": s.get("count_7d", 0),
+            "can_toggle_paid": email not in ADMIN_EMAILS and email not in PREMIUM_EMAILS,
+        })
+
+    return {"page": page, "page_size": page_size, "total": total, "items": items}
+
+@app.post("/api/admin/users/set-paid")
+def admin_users_set_paid(
+    payload: SetPaidPayload,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    _require_admin(current_user)
+
+    email_l = (payload.email or "").strip().lower()
+    if not email_l:
+        raise HTTPException(status_code=400, detail="email required")
+
+    if email_l in ADMIN_EMAILS or email_l in PREMIUM_EMAILS:
+        raise HTTPException(status_code=400, detail="This user is managed via env (ADMIN_EMAILS/PREMIUM_EMAILS)." )
+
+    u = db.query(User).filter(func.lower(User.email) == email_l).first()
+    if not u:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    if not hasattr(u, "is_paid"):
+        raise HTTPException(status_code=500, detail="User model missing 'is_paid' column")
+
+    u.is_paid = bool(payload.is_paid)
+    db.add(u); db.commit(); db.refresh(u)
+    return {"email": u.email, "is_paid": bool(u.is_paid)}
+
 # ---------- misc debug ----------
 @app.get("/api/debug/ping-db")
 def ping_db(db: Session = Depends(get_db)):
