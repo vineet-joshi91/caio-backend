@@ -759,6 +759,139 @@ def admin_users_set_paid(
     db.add(u); db.commit(); db.refresh(u)
     return {"email": u.email, "is_paid": bool(u.is_paid)}
 
+# ---------- Admin: user summary + roster with sessions & spend ----------
+
+from typing import Optional, Dict, List
+from pydantic import BaseModel  # ensure imported once
+from sqlalchemy import func
+
+USD_PER_TOKEN_FALLBACK = 0.000002  # used only if you don't log cost_usd
+
+def _tier_for(email: str, is_paid: bool) -> str:
+    e = (email or "").lower()
+    if e in ADMIN_EMAILS or e in PREMIUM_EMAILS:
+        return "premium"
+    if is_paid:
+        return "pro"
+    return "demo"
+
+@app.get("/api/admin/users/summary")
+def admin_users_summary(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    _require_admin(current_user)
+
+    users: List[User] = db.query(User).all()
+    total = len(users)
+    demo = pro = premium = 0
+    for u in users:
+        tier = _tier_for(getattr(u, "email", "") or "", bool(getattr(u, "is_paid", False)))
+        if tier == "premium":
+            premium += 1
+        elif tier == "pro":
+            pro += 1
+        else:
+            demo += 1
+
+    return {"total_users": total, "demo": demo, "pro": pro, "premium": premium}
+
+@app.get("/api/admin/users/roster")
+def admin_users_roster_view(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(25, ge=1, le=200),
+    q: Optional[str] = Query(None, description="search by email"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    _require_admin(current_user)
+
+    # Base query (searchable)
+    base = db.query(User)
+    if q:
+        like = f"%{q.lower()}%"
+        base = base.filter(func.lower(User.email).like(like))
+
+    total = base.count()
+    users: List[User] = (
+        base.order_by(User.created_at.desc() if hasattr(User, "created_at") else User.email.asc())
+            .offset((page - 1) * page_size)
+            .limit(page_size)
+            .all()
+    )
+
+    # Preload stats for these users
+    ids = [getattr(u, "id", 0) for u in users if getattr(u, "id", 0)]
+    stats: Dict[int, Dict] = {int(uid): {} for uid in ids}
+
+    # last seen from UsageLog
+    if ids:
+        last_rows = (
+            db.query(UsageLog.user_id, func.max(UsageLog.timestamp))
+              .filter(UsageLog.user_id.in_(ids))
+              .group_by(UsageLog.user_id)
+              .all()
+        )
+        for uid, last_ts in last_rows:
+            stats[int(uid)]["last_seen"] = (last_ts.isoformat() + "Z") if last_ts else None
+
+    # total chat sessions
+    try:
+        if ids:
+            sess_rows = (
+                db.query(ChatSession.user_id, func.count(ChatSession.id))
+                  .filter(ChatSession.user_id.in_(ids))
+                  .group_by(ChatSession.user_id)
+                  .all()
+            )
+            for uid, c in sess_rows:
+                stats[int(uid)]["total_sessions"] = int(c or 0)
+    except Exception:
+        # If ChatSession table is missing, default to 0
+        pass
+
+    # spend (prefer cost_usd; else tokens * fallback)
+    cost_col = getattr(UsageLog, "cost_usd", None)
+    tokens_col = getattr(UsageLog, "total_tokens", None) or getattr(UsageLog, "tokens", None)
+
+    if ids and cost_col is not None:
+        cost_rows = (
+            db.query(UsageLog.user_id, func.coalesce(func.sum(cost_col), 0.0))
+              .filter(UsageLog.user_id.in_(ids))
+              .group_by(UsageLog.user_id)
+              .all()
+        )
+        for uid, cost in cost_rows:
+            stats[int(uid)]["spend_usd"] = float(cost or 0.0)
+    elif ids and tokens_col is not None:
+        tok_rows = (
+            db.query(UsageLog.user_id, func.coalesce(func.sum(tokens_col), 0))
+              .filter(UsageLog.user_id.in_(ids))
+              .group_by(UsageLog.user_id)
+              .all()
+        )
+        for uid, toks in tok_rows:
+            stats[int(uid)]["spend_usd"] = float(toks or 0) * USD_PER_TOKEN_FALLBACK
+
+    # Build items
+    items = []
+    for u in users:
+        uid = int(getattr(u, "id", 0) or 0)
+        email = getattr(u, "email", "") or ""
+        tier = _tier_for(email, bool(getattr(u, "is_paid", False)))
+        created = getattr(u, "created_at", None)
+        s = stats.get(uid, {}) if uid else {}
+        items.append({
+            "email": email,
+            "tier": tier,
+            "created_at": created.isoformat() + "Z" if created else None,
+            "last_seen": s.get("last_seen"),
+            "total_sessions": int(s.get("total_sessions", 0)),
+            "spend_usd": float(s.get("spend_usd", 0.0)),
+        })
+
+    return {"page": page, "page_size": page_size, "total": total, "items": items}
+
 # ---------- misc debug ----------
 @app.get("/api/debug/ping-db")
 def ping_db(db: Session = Depends(get_db)):
