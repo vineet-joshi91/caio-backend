@@ -333,7 +333,7 @@ async def analyze(
         logger.error("Extraction failed: %s", e)
         extracted = ""
     brief = (text or "").strip()
-    chosen = _choose_brains(brains, is_paid=True)
+    chosen = order_brains_for_content(brief, extracted, is_paid=True) if not brains else _choose_brains(brains, True)
     if not extracted and not brief:
         raise HTTPException(status_code=400, detail="Please upload a file or provide text")
 
@@ -368,6 +368,64 @@ async def analyze(
 def _is_premium_or_admin(user: User) -> bool:
     email = (user.email or "").lower()
     return email in ADMIN_EMAILS or email in PREMIUM_EMAILS
+
+# ====== PRIMARY CXO ROUTING (added) ======
+PRIMARY_KEYWORDS = {
+    "CFO": [
+        "revenue","sales","turnover","profit","margin","ebitda","p&l","pnl","balance sheet","cash flow",
+        "runway","burn","budget","forecast","pricing","unit economics","cost of goods","cogs","ar","ap",
+        "working capital","inventory","gross margin","net margin"
+    ],
+    "COO": [
+        "operations","operational","throughput","capacity","utilization","sla","uptime","downtime","logistics",
+        "supply chain","fulfilment","fulfillment","warehouse","production","quality","defect","lead time",
+        "process","workflow","on-time","takt","bottleneck"
+    ],
+    "CHRO": [
+        "attrition","churn of employees","engagement","morale","headcount","hiring","performance review",
+        "compensation","pay","benefits","hr","policy","culture","training","learning","succession","l&d"
+    ],
+    "CMO": [
+        "marketing","campaign","brand","awareness","lead","mql","sql","conversion","funnel","ad","seo","sem",
+        "content","social","newsletter","cac","ltv","retention","churn","activation"
+    ],
+    "CPO": [
+        "recruiting","talent","candidate","pipeline","sourcing","screening","time to hire","offer acceptance",
+        "quality of hire","employer brand","interview"
+    ],
+}
+
+MODEL_HINT_MAP = {
+    "CFO": "Start with CFO Recommendations first (numbered). Reference metrics like revenue growth, margins, CAC/LTV, cash runway.",
+    "COO": "Start with COO Recommendations first (numbered). Focus on throughput, reliability, process constraints, and cost-to-serve.",
+    "CHRO": "Start with CHRO Recommendations first (numbered). Address attrition, engagement, hiring pipelines, and org effectiveness.",
+    "CMO": "Start with CMO Recommendations first (numbered). Cover growth levers, funnel conversion, retention and ROI.",
+    "CPO": "Start with CPO Recommendations first (numbered). Cover recruiting pipeline, time-to-hire, offer acceptance and QoH.",
+}
+
+def _pick_primary_cxo(blob: str) -> str:
+    """
+    Heuristic: count keyword hits per CXO and pick max; default CFO.
+    """
+    txt = (blob or "").lower()
+    scores = {k: 0 for k in PRIMARY_KEYWORDS.keys()}
+    for role, kws in PRIMARY_KEYWORDS.items():
+        for kw in kws:
+            if kw in txt:
+                scores[role] += 1
+    # choose highest; CFO default
+    role = max(scores.items(), key=lambda kv: kv[1])[0] if scores else "CFO"
+    return role or "CFO"
+
+def _compose_premium_system_prompt(primary_role: str) -> str:
+    base = (
+        "You are CAIO Premium assistant. Be concise, actionable, and executive-friendly. "
+        "Use numbered steps for plans and bullets for insights. If a document excerpt is provided, ground your answer in it. "
+        "After the primary CXO block, add short notes from other CXOs when relevant."
+    )
+    hint = MODEL_HINT_MAP.get(primary_role, "")
+    return f"{base}\nPrimary persona: {primary_role}. {hint}".strip()
+# ====== end PRIMARY CXO ROUTING (added) ======
 
 def _llm_chat(messages: List[dict]) -> str:
     """
@@ -448,11 +506,11 @@ async def chat_send(
     except Exception as e:
         logger.warning("File read failed: %s", e); context = ""
 
+    # --- added: pick a primary CXO based on message+context ---
+    primary_role = _pick_primary_cxo(f"{context}\n\n{message}")
+
     # Build LLM messages (simple)
-    sys_prompt = (
-        "You are CAIO Premium assistant. Be concise, actionable, and executive-friendly. "
-        "Use numbered steps for plans, bullets for insights. If a document excerpt is provided, ground your answer in it."
-    )
+    sys_prompt = _compose_premium_system_prompt(primary_role)
     msgs: List[dict] = [{"role":"system","content":sys_prompt}]
     for m in _history(db, sess.id, getattr(current_user, "id", 0) or 0, limit=20):
         msgs.append({"role": m.role, "content": m.content})
