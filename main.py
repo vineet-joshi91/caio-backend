@@ -1,4 +1,4 @@
-# main.py
+# main.py (CAIO Backend) — drop-in replacement
 import os, logging, traceback, json, re
 from typing import Optional, List, Tuple
 from datetime import datetime, timedelta
@@ -31,6 +31,7 @@ ALLOWED_ORIGINS = [
 extra = os.getenv("ALLOWED_ORIGINS", "")
 if extra:
     ALLOWED_ORIGINS += [o.strip() for o in extra.split(",") if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
@@ -58,8 +59,9 @@ def ready():
 ADMIN_EMAILS = {e.strip().lower() for e in os.getenv("ADMIN_EMAILS", "vineetpjoshi.71@gmail.com").split(",") if e.strip()}
 PREMIUM_EMAILS = {e.strip().lower() for e in os.getenv("PREMIUM_EMAILS", "").split(",") if e.strip()}
 
-DEMO_DAILY_LIMIT = int(os.getenv("DEMO_DAILY_LIMIT", "5"))
-PRO_DAILY_LIMIT  = int(os.getenv("PRO_DAILY_LIMIT",  "50"))
+# NEW: honor both legacy and new env names seamlessly
+DEMO_DAILY_LIMIT = int(os.getenv("DEMO_DAILY_LIMIT", os.getenv("FREE_QUERIES_PER_DAY", "5")))
+PRO_DAILY_LIMIT  = int(os.getenv("PRO_DAILY_LIMIT",  os.getenv("PRO_QUERIES_PER_DAY", "50")))
 
 def _login_core(email: str, password: str, db: Session):
     if not email or not password:
@@ -70,7 +72,7 @@ def _login_core(email: str, password: str, db: Session):
             raise RuntimeError("User model missing 'hashed_password'")
         if not verify_password(password, user.hashed_password):
             raise HTTPException(status_code=400, detail="Incorrect email or password")
-        # --- NEW: auto-sync flags from env on every login ---
+        # auto-sync flags from env on every login
         email_l = email.lower()
         is_admin_now = email_l in ADMIN_EMAILS
         is_premium_now = email_l in PREMIUM_EMAILS
@@ -78,7 +80,6 @@ def _login_core(email: str, password: str, db: Session):
         if hasattr(user, "is_admin") and user.is_admin != is_admin_now:
             user.is_admin = is_admin_now
             changed = True
-        # keep is_paid true for admin/premium so legacy UI never shows "Demo"
         if hasattr(user, "is_paid") and (is_admin_now or is_premium_now) and not user.is_paid:
             user.is_paid = True
             changed = True
@@ -333,7 +334,13 @@ async def analyze(
         logger.error("Extraction failed: %s", e)
         extracted = ""
     brief = (text or "").strip()
-    chosen = order_brains_for_content(brief, extracted, is_paid=True) if not brains else _choose_brains(brains, True)
+
+    # If you have a smarter ordering function elsewhere, use it; else fall back:
+    try:
+        chosen = order_brains_for_content(brief, extracted, is_paid=True) if not brains else _choose_brains(brains, True)  # type: ignore
+    except Exception:
+        chosen = _choose_brains(brains, True)
+
     if not extracted and not brief:
         raise HTTPException(status_code=400, detail="Please upload a file or provide text")
 
@@ -369,7 +376,7 @@ def _is_premium_or_admin(user: User) -> bool:
     email = (user.email or "").lower()
     return email in ADMIN_EMAILS or email in PREMIUM_EMAILS
 
-# ====== PRIMARY CXO ROUTING (added) ======
+# ====== PRIMARY CXO ROUTING ======
 PRIMARY_KEYWORDS = {
     "CFO": [
         "revenue","sales","turnover","profit","margin","ebitda","p&l","pnl","balance sheet","cash flow",
@@ -404,16 +411,12 @@ MODEL_HINT_MAP = {
 }
 
 def _pick_primary_cxo(blob: str) -> str:
-    """
-    Heuristic: count keyword hits per CXO and pick max; default CFO.
-    """
     txt = (blob or "").lower()
     scores = {k: 0 for k in PRIMARY_KEYWORDS.keys()}
     for role, kws in PRIMARY_KEYWORDS.items():
         for kw in kws:
             if kw in txt:
                 scores[role] += 1
-    # choose highest; CFO default
     role = max(scores.items(), key=lambda kv: kv[1])[0] if scores else "CFO"
     return role or "CFO"
 
@@ -425,7 +428,7 @@ def _compose_premium_system_prompt(primary_role: str) -> str:
     )
     hint = MODEL_HINT_MAP.get(primary_role, "")
     return f"{base}\nPrimary persona: {primary_role}. {hint}".strip()
-# ====== end PRIMARY CXO ROUTING (added) ======
+# ====== end PRIMARY CXO ROUTING ======
 
 def _llm_chat(messages: List[dict]) -> str:
     """
@@ -433,7 +436,6 @@ def _llm_chat(messages: List[dict]) -> str:
     """
     providers = _pick_provider(is_paid=True)  # use Pro provider quality for premium
     import requests
-    # Try OpenAI first if available
     if "openai" in providers:
         key = os.getenv("OPENAI_API_KEY")
         headers = {"Authorization": f"Bearer {key}", "Content-Type":"application/json"}
@@ -443,7 +445,6 @@ def _llm_chat(messages: List[dict]) -> str:
         r = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, data=json.dumps(data), timeout=60)
         if r.status_code < 400:
             return r.json()["choices"][0]["message"]["content"]
-    # Fallback to OpenRouter
     if "openrouter" in providers:
         key = os.getenv("OPENROUTER_API_KEY")
         headers = {"Authorization": f"Bearer {key}","HTTP-Referer":"https://caio-frontend.vercel.app","X-Title":"CAIO","Content-Type":"application/json"}
@@ -451,14 +452,12 @@ def _llm_chat(messages: List[dict]) -> str:
         r = requests.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, data=json.dumps(data), timeout=60)
         if r.status_code < 400:
             return r.json()["choices"][0]["message"]["content"]
-    # Last resort
     return "I’m online but couldn’t reach the model provider just now. Please try again in a bit."
 
 def _ensure_session(db: Session, user_id: int, session_id: Optional[int], title_hint: Optional[str]) -> ChatSession:
     if session_id:
         sess = db.query(ChatSession).filter(ChatSession.id==session_id, ChatSession.user_id==user_id).first()
         if sess: return sess
-    # create new
     title = (title_hint or "New conversation")[:255]
     sess = ChatSession(user_id=user_id, title=title, created_at=datetime.utcnow())
     db.add(sess); db.commit(); db.refresh(sess)
@@ -488,28 +487,17 @@ async def chat_send(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    # Premium/Admin only
     if not _is_premium_or_admin(current_user):
         raise HTTPException(status_code=403, detail="Chat is a Premium feature. Contact us for access.")
-
-    # Log (no cap for premium/admin)
     db.add(UsageLog(user_id=getattr(current_user, "id", 0) or 0, timestamp=datetime.utcnow(), endpoint="chat", status="ok"))
     db.commit()
-
-    # Create or reuse session
     sess = _ensure_session(db, getattr(current_user, "id", 0) or 0, session_id, title_hint=message[:60])
-
-    # Optional file context
     context = ""
     try:
         context = (await _extract_text(file)).strip() if file else ""
     except Exception as e:
         logger.warning("File read failed: %s", e); context = ""
-
-    # --- added: pick a primary CXO based on message+context ---
     primary_role = _pick_primary_cxo(f"{context}\n\n{message}")
-
-    # Build LLM messages (simple)
     sys_prompt = _compose_premium_system_prompt(primary_role)
     msgs: List[dict] = [{"role":"system","content":sys_prompt}]
     for m in _history(db, sess.id, getattr(current_user, "id", 0) or 0, limit=20):
@@ -517,16 +505,9 @@ async def chat_send(
     if context:
         msgs.append({"role":"system","content": f"[DOCUMENT EXCERPT]\n{context[:8000]}"})
     msgs.append({"role":"user","content": message})
-
-    # Save user message
     _save_msg(db, sess.id, "user", message)
-
-    # Call model
     reply = _llm_chat(msgs)[:120000]
-
-    # Save assistant message
     _save_msg(db, sess.id, "assistant", reply)
-
     return {"session_id": sess.id, "assistant": reply}
 
 @app.get("/api/chat/history")
@@ -576,7 +557,6 @@ def admin_usage(
     now = datetime.utcnow()
     since = now - timedelta(days=days - 1)
 
-    # Dialect-safe "day" bucket
     if db.bind.dialect.name == "postgresql":
         daycol = func.date_trunc("day", UsageLog.timestamp)
     else:  # sqlite
@@ -585,7 +565,7 @@ def admin_usage(
     rows = (
         db.query(daycol.label("day"), UsageLog.endpoint, func.count(UsageLog.id).label("count"))
         .filter(UsageLog.timestamp >= since)
-        .group_by("day", UsageLog.endpoint)
+        .group_by("day", "endpoint")
         .order_by("day")
         .all()
     )
@@ -706,7 +686,6 @@ def admin_users_roster(
         since1 = now - timedelta(days=1)
         since7 = now - timedelta(days=7)
 
-        # last seen
         last_rows = (
             db.query(UsageLog.user_id, func.max(UsageLog.timestamp))
               .filter(UsageLog.user_id.in_(user_ids))
@@ -716,7 +695,6 @@ def admin_users_roster(
         for uid, last_ts in last_rows:
             stats[int(uid)] = {"last_seen": (last_ts.isoformat() + "Z") if last_ts else None}
 
-        # 24h totals
         r24 = (
             db.query(UsageLog.user_id, func.count(UsageLog.id))
               .filter(UsageLog.user_id.in_(user_ids), UsageLog.timestamp >= since1)
@@ -726,7 +704,6 @@ def admin_users_roster(
         for uid, c in r24:
             stats.setdefault(int(uid), {})["count_24h"] = int(c)
 
-        # 24h analyze
         r24a = (
             db.query(UsageLog.user_id, func.count(UsageLog.id))
               .filter(
@@ -740,7 +717,6 @@ def admin_users_roster(
         for uid, c in r24a:
             stats.setdefault(int(uid), {})["analyze_24h"] = int(c)
 
-        # 24h chat
         r24c = (
             db.query(UsageLog.user_id, func.count(UsageLog.id))
               .filter(
@@ -754,7 +730,6 @@ def admin_users_roster(
         for uid, c in r24c:
             stats.setdefault(int(uid), {})["chat_24h"] = int(c)
 
-        # 7d total
         r7 = (
             db.query(UsageLog.user_id, func.count(UsageLog.id))
               .filter(UsageLog.user_id.in_(user_ids), UsageLog.timestamp >= since7)
@@ -817,9 +792,8 @@ def admin_users_set_paid(
     db.add(u); db.commit(); db.refresh(u)
     return {"email": u.email, "is_paid": bool(u.is_paid)}
 
-# ---------- Admin: user summary + roster with sessions & spend ----------
-
-from typing import Optional, Dict, List
+# ---------- Admin: user summary & roster (alt view) ----------
+from typing import Optional, Dict, List  # re-import safe
 from pydantic import BaseModel  # ensure imported once
 from sqlalchemy import func
 
@@ -864,7 +838,6 @@ def admin_users_roster_view(
 ):
     _require_admin(current_user)
 
-    # Base query (searchable)
     base = db.query(User)
     if q:
         like = f"%{q.lower()}%"
@@ -878,11 +851,9 @@ def admin_users_roster_view(
             .all()
     )
 
-    # Preload stats for these users
     ids = [getattr(u, "id", 0) for u in users if getattr(u, "id", 0)]
     stats: Dict[int, Dict] = {int(uid): {} for uid in ids}
 
-    # last seen from UsageLog
     if ids:
         last_rows = (
             db.query(UsageLog.user_id, func.max(UsageLog.timestamp))
@@ -893,9 +864,7 @@ def admin_users_roster_view(
         for uid, last_ts in last_rows:
             stats[int(uid)]["last_seen"] = (last_ts.isoformat() + "Z") if last_ts else None
 
-    # total chat sessions
-    try:
-        if ids:
+        try:
             sess_rows = (
                 db.query(ChatSession.user_id, func.count(ChatSession.id))
                   .filter(ChatSession.user_id.in_(ids))
@@ -904,34 +873,31 @@ def admin_users_roster_view(
             )
             for uid, c in sess_rows:
                 stats[int(uid)]["total_sessions"] = int(c or 0)
-    except Exception:
-        # If ChatSession table is missing, default to 0
-        pass
+        except Exception:
+            pass
 
-    # spend (prefer cost_usd; else tokens * fallback)
-    cost_col = getattr(UsageLog, "cost_usd", None)
-    tokens_col = getattr(UsageLog, "total_tokens", None) or getattr(UsageLog, "tokens", None)
+        cost_col = getattr(UsageLog, "cost_usd", None)
+        tokens_col = getattr(UsageLog, "total_tokens", None) or getattr(UsageLog, "tokens", None)
 
-    if ids and cost_col is not None:
-        cost_rows = (
-            db.query(UsageLog.user_id, func.coalesce(func.sum(cost_col), 0.0))
-              .filter(UsageLog.user_id.in_(ids))
-              .group_by(UsageLog.user_id)
-              .all()
-        )
-        for uid, cost in cost_rows:
-            stats[int(uid)]["spend_usd"] = float(cost or 0.0)
-    elif ids and tokens_col is not None:
-        tok_rows = (
-            db.query(UsageLog.user_id, func.coalesce(func.sum(tokens_col), 0))
-              .filter(UsageLog.user_id.in_(ids))
-              .group_by(UsageLog.user_id)
-              .all()
-        )
-        for uid, toks in tok_rows:
-            stats[int(uid)]["spend_usd"] = float(toks or 0) * USD_PER_TOKEN_FALLBACK
+        if cost_col is not None:
+            cost_rows = (
+                db.query(UsageLog.user_id, func.coalesce(func.sum(cost_col), 0.0))
+                  .filter(UsageLog.user_id.in_(ids))
+                  .group_by(UsageLog.user_id)
+                  .all()
+            )
+            for uid, cost in cost_rows:
+                stats[int(uid)]["spend_usd"] = float(cost or 0.0)
+        elif tokens_col is not None:
+            tok_rows = (
+                db.query(UsageLog.user_id, func.coalesce(func.sum(tokens_col), 0))
+                  .filter(UsageLog.user_id.in_(ids))
+                  .group_by(UsageLog.user_id)
+                  .all()
+            )
+            for uid, toks in tok_rows:
+                stats[int(uid)]["spend_usd"] = float(toks or 0) * USD_PER_TOKEN_FALLBACK
 
-    # Build items
     items = []
     for u in users:
         uid = int(getattr(u, "id", 0) or 0)
@@ -971,14 +937,22 @@ def debug_routers():
             out.append({"path": path, "methods": methods})
     return out
 
-# ---------- other routers (kept if present) ----------
+# ---------- other routers ----------
 try:
     from routes_public_config import router as public_cfg_router
     app.include_router(public_cfg_router)
 except Exception as e:
     logger.warning(f"routes_public_config not loaded: {e}")
+
 try:
     from payment_routes import router as payments_router
     app.include_router(payments_router)
 except Exception as e:
     logger.warning(f"payment_routes not loaded: {e}")
+
+# NEW: include the admin metrics router so /api/admin/metrics works
+try:
+    from admin_metrics_routes import router as admin_metrics_router
+    app.include_router(admin_metrics_router)
+except Exception as e:
+    logger.warning(f"admin_metrics_routes not loaded: {e}")
