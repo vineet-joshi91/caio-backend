@@ -19,7 +19,28 @@ logger = logging.getLogger("caio")
 DEBUG = os.getenv("DEBUG", "0") in ("1","true","TRUE","yes","YES")
 
 app = FastAPI(title="CAIO Backend", version="0.3.1")
-init_db()
+
+@app.get("/")
+def index():
+    return {"ok": True, "service": "caio-backend", "time": datetime.utcnow().isoformat() + "Z"}
+
+@app.on_event("startup")
+def _startup_init_db():
+    try:
+        from time import sleep
+        attempts = 0
+        while attempts < 5:
+            try:
+                init_db()
+                break
+            except Exception as e:
+                attempts += 1
+                logging.warning(f"init_db() failed (attempt {attempts}/5): {e}")
+                sleep(2 * attempts)
+        else:
+            logging.error("init_db() failed after retries; continuing to serve /api/health")
+    except Exception as e:
+        logging.error(f"startup hook error: {e}")
 
 # ---------- CORS ----------
 ALLOWED_ORIGINS = [
