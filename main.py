@@ -1,24 +1,26 @@
-# main.py (CAIO Backend) — OpenRouter-only, stable startup
+# main.py — CAIO Backend (OpenRouter-only + Pro+ surfaced)
 import os, logging, traceback, json
 from typing import Optional, List, Tuple, Dict
 from datetime import datetime, timedelta
 from io import BytesIO
 
-from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Request, Body, Query
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Request, Query
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordRequestForm
+
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 
 from db import get_db, User, init_db, UsageLog, ChatSession, ChatMessage
 from auth import create_access_token, verify_password, get_password_hash, get_current_user
 
+# ---------- Logging / Debug ----------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("caio")
-DEBUG = os.getenv("DEBUG", "0") in ("1","true","TRUE","yes","YES")
+DEBUG = os.getenv("DEBUG", "0") in ("1", "true", "TRUE", "yes", "YES")
 
-app = FastAPI(title="CAIO Backend", version="0.3.2")
+app = FastAPI(title="CAIO Backend", version="0.4.0")
 
 # ---------- CORS ----------
 ALLOWED_ORIGINS = [
@@ -45,7 +47,7 @@ app.add_middleware(
 def cors_preflight(path: str):
     return JSONResponse({"ok": True})
 
-# ---------- Stable startup (retry DB) ----------
+# ---------- Stable startup (retry DB so app doesn't crash) ----------
 @app.on_event("startup")
 def _startup_init_db():
     try:
@@ -60,7 +62,7 @@ def _startup_init_db():
                 logging.warning(f"init_db() failed (attempt {attempts}/5): {e}")
                 sleep(2 * attempts)
         else:
-            logging.error("init_db() failed after retries; service still serving /api/health")
+            logging.error("init_db() failed after retries; still serving /api/health")
     except Exception as e:
         logging.error(f"startup hook error: {e}")
 
@@ -71,22 +73,86 @@ def index():
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "version": "0.3.2"}
+    return {"status": "ok", "version": "0.4.0"}
 
 @app.get("/api/ready")
 def ready():
     return {"ready": True, "time": datetime.utcnow().isoformat() + "Z"}
 
-# ---------- Auth / Tiers ----------
-ADMIN_EMAILS = {e.strip().lower() for e in os.getenv("ADMIN_EMAILS", "vineetpjoshi.71@gmail.com").split(",") if e.strip()}
+# ---------- Admin lists / Tiers ----------
+ADMIN_EMAILS   = {e.strip().lower() for e in os.getenv("ADMIN_EMAILS", "vineetpjoshi.71@gmail.com").split(",") if e.strip()}
 PREMIUM_EMAILS = {e.strip().lower() for e in os.getenv("PREMIUM_EMAILS", "").split(",") if e.strip()}
 PRO_PLUS_EMAILS = {e.strip().lower() for e in os.getenv("PRO_PLUS_EMAILS", "").split(",") if e.strip()}
 
-# Limits (support new + legacy env names)
+# ---------- Limits ----------
 DEMO_DAILY_LIMIT = int(os.getenv("DEMO_DAILY_LIMIT", os.getenv("FREE_QUERIES_PER_DAY", "5")))
 PRO_DAILY_LIMIT  = int(os.getenv("PRO_DAILY_LIMIT",  os.getenv("PRO_QUERIES_PER_DAY", "50")))
 PRO_PLUS_MSGS_PER_DAY = int(os.getenv("PRO_PLUS_MSGS_PER_DAY", "25"))
 
+def _user_tier(user: User) -> str:
+    email = (user.email or "").lower()
+    if email in ADMIN_EMAILS:
+        return "admin"
+    if email in PREMIUM_EMAILS:
+        return "premium"
+    if email in PRO_PLUS_EMAILS or getattr(user, "plan_tier", "") == "pro_plus":
+        return "pro_plus"
+    return "pro" if bool(getattr(user, "is_paid", False)) else "demo"
+
+def _limit_for_tier(tier: str, endpoint: str) -> Optional[int]:
+    if tier in ("admin", "premium"):
+        return None  # unlimited
+    if endpoint == "chat" and tier == "pro_plus":
+        return PRO_PLUS_MSGS_PER_DAY
+    return PRO_DAILY_LIMIT if tier == "pro" else DEMO_DAILY_LIMIT
+
+def _today_range_utc() -> Tuple[datetime, datetime]:
+    now = datetime.utcnow()
+    return datetime(now.year, now.month, now.day), datetime(now.year, now.month, now.day, 23, 59, 59, 999999)
+
+def _check_and_increment_usage(db: Session, user: User, endpoint: str):
+    tier = _user_tier(user)
+    limit = _limit_for_tier(tier, endpoint)
+    start, end = _today_range_utc()
+
+    # free/unlimited tiers still log usage
+    if limit is None:
+        db.add(UsageLog(user_id=getattr(user, "id", 0) or 0, timestamp=datetime.utcnow(), endpoint=endpoint, status="ok"))
+        db.commit()
+        return True, 0, None, end, tier
+
+    used = (
+        db.query(UsageLog)
+        .filter(UsageLog.user_id == getattr(user, "id", 0))
+        .filter(UsageLog.endpoint == endpoint)
+        .filter(UsageLog.timestamp >= start)
+        .filter(UsageLog.timestamp <= end)
+        .count()
+    )
+    if used >= limit:
+        return False, used, limit, end, tier
+
+    db.add(UsageLog(user_id=getattr(user, "id", 0) or 0, timestamp=datetime.utcnow(), endpoint=endpoint, status="ok"))
+    db.commit()
+    return True, used + 1, limit, end, tier
+
+def _limit_response(used: int, limit: int, reset_at: datetime, tier: str, endpoint: str):
+    plan = "Pro+" if tier == "pro_plus" else ("Pro" if tier == "pro" else "Demo")
+    return JSONResponse(
+        status_code=429,
+        content={
+            "status": "error",
+            "title": "Daily limit reached",
+            "message": f"You've used {used}/{limit} {plan} {endpoint} requests today. Resets at {reset_at.strftime('%H:%M')} UTC.",
+            "plan": tier,
+            "used": used,
+            "limit": limit,
+            "remaining": max(0, limit - used),
+            "reset_at": reset_at.isoformat() + "Z",
+        },
+    )
+
+# ---------- Auth ----------
 def _login_core(email: str, password: str, db: Session):
     if not email or not password:
         raise HTTPException(status_code=400, detail="Email and password required")
@@ -96,6 +162,7 @@ def _login_core(email: str, password: str, db: Session):
             raise RuntimeError("User model missing 'hashed_password'")
         if not verify_password(password, user.hashed_password):
             raise HTTPException(status_code=400, detail="Incorrect email or password")
+        # ensure env-driven roles are reflected
         email_l = email.lower()
         is_admin_now = email_l in ADMIN_EMAILS
         is_premium_now = email_l in PREMIUM_EMAILS
@@ -140,11 +207,16 @@ def login(form: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get
 @app.get("/api/profile")
 def profile(current_user: User = Depends(get_current_user)):
     email = current_user.email.lower()
-    tier = "admin" if email in ADMIN_EMAILS else (
-        "premium" if email in PREMIUM_EMAILS else (
-            "pro" if getattr(current_user, "is_paid", False) else "demo"
-        )
-    )
+    if email in ADMIN_EMAILS:
+        tier = "admin"
+    elif email in PREMIUM_EMAILS:
+        tier = "premium"
+    elif email in PRO_PLUS_EMAILS or getattr(current_user, "plan_tier", "") == "pro_plus":
+        tier = "pro_plus"
+    elif bool(getattr(current_user, "is_paid", False)):
+        tier = "pro"
+    else:
+        tier = "demo"
     return {
         "email": current_user.email,
         "is_admin": email in ADMIN_EMAILS,
@@ -152,63 +224,6 @@ def profile(current_user: User = Depends(get_current_user)):
         "created_at": getattr(current_user, "created_at", None),
         "tier": tier,
     }
-
-# ---------- Limits / usage logging ----------
-def _user_tier(user: User) -> str:
-    email = (user.email or "").lower()
-    if email in ADMIN_EMAILS: return "admin"
-    if email in PREMIUM_EMAILS: return "premium"
-    if email in PRO_PLUS_EMAILS: return "pro_plus"
-    return "pro" if bool(getattr(user, "is_paid", False)) else "demo"
-
-def _limit_for_tier(tier: str, endpoint: str) -> Optional[int]:
-    if tier in ("admin", "premium"):  # unlimited
-        return None
-    if endpoint == "chat" and tier == "pro_plus":
-        return PRO_PLUS_MSGS_PER_DAY
-    return PRO_DAILY_LIMIT if tier == "pro" else DEMO_DAILY_LIMIT
-
-def _today_range_utc() -> Tuple[datetime, datetime]:
-    now = datetime.utcnow()
-    return datetime(now.year, now.month, now.day), datetime(now.year, now.month, now.day, 23, 59, 59, 999999)
-
-def _check_and_increment_usage(db: Session, user: User, endpoint: str):
-    tier = _user_tier(user)
-    limit = _limit_for_tier(tier, endpoint)
-    start, end = _today_range_utc()
-    if limit is None:
-        db.add(UsageLog(user_id=getattr(user, "id", 0) or 0, timestamp=datetime.utcnow(), endpoint=endpoint, status="ok"))
-        db.commit()
-        return True, 0, None, end, tier
-    used = (
-        db.query(UsageLog)
-        .filter(UsageLog.user_id == getattr(user, "id", 0))
-        .filter(UsageLog.endpoint == endpoint)
-        .filter(UsageLog.timestamp >= start)
-        .filter(UsageLog.timestamp <= end)
-        .count()
-    )
-    if used >= limit:
-        return False, used, limit, end, tier
-    db.add(UsageLog(user_id=getattr(user, "id", 0) or 0, timestamp=datetime.utcnow(), endpoint=endpoint, status="ok"))
-    db.commit()
-    return True, used + 1, limit, end, tier
-
-def _limit_response(used: int, limit: int, reset_at: datetime, tier: str, endpoint: str):
-    plan = "Pro+" if tier == "pro_plus" else ("Pro" if tier == "pro" else "Demo")
-    return JSONResponse(
-        status_code=429,
-        content={
-            "status": "error",
-            "title": "Daily limit reached",
-            "message": f"You've used {used}/{limit} {plan} {endpoint} requests today. Resets at {reset_at.strftime('%H:%M')} UTC.",
-            "plan": tier,
-            "used": used,
-            "limit": limit,
-            "remaining": max(0, limit - used),
-            "reset_at": reset_at.isoformat() + "Z",
-        },
-    )
 
 # ---------- File parsing ----------
 def _read_txt(body: bytes) -> str:
@@ -256,7 +271,7 @@ async def _extract_text(file: Optional[UploadFile]) -> str:
     if name.endswith(".csv"):  return _read_csv(body)
     return _read_txt(body)
 
-# ---------- Analysis prompt builder ----------
+# ---------- Analyze (OpenRouter-only) ----------
 DEFAULT_BRAINS_ORDER = ["CFO","COO","CHRO","CMO","CPO"]
 
 def _choose_brains(requested: Optional[str], is_paid: bool) -> List[str]:
@@ -297,7 +312,6 @@ Return STRICT MARKDOWN ONLY for **{brain}** with this structure:
 {(extracted or "")[:120000]}
 """.strip()
 
-# ---------- OpenRouter-only LLM calls ----------
 OPENROUTER_API = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_MODEL = os.getenv("LLM_MODEL_OPENROUTER", "openrouter/auto")
 
@@ -318,7 +332,6 @@ def _call_openrouter_chat(messages: List[dict], temperature: float = 0.2) -> str
         raise RuntimeError(f"OpenRouter {r.status_code}: {r.text}")
     return r.json()["choices"][0]["message"]["content"]
 
-# ---------- Analyze ----------
 @app.post("/api/analyze")
 async def analyze(
     request: Request,
@@ -332,14 +345,13 @@ async def analyze(
     if not ok:
         return _limit_response(used, int(limit or 0), reset_at, tier, "analyze")
 
-    if tier in ("demo",):
+    if tier == "demo":
         chosen = _choose_brains(brains, is_paid=False)
         return JSONResponse({
             "status":"demo",
             "title": f"Demo Mode · {', '.join(chosen)}",
-            "summary":"This is a demo preview. Upgrade to Pro/Pro+ to run all brains with real analysis.\n"
-                      f"Brains used: {', '.join(chosen)}",
-            "tip":"Upload a business document or provide a brief to see the flow.",
+            "summary":"This is a demo preview. Upgrade to Pro / Pro+ / Premium to run full brains.",
+            "tip":"Upload a document or provide a brief to see the flow.",
         })
 
     try:
@@ -352,10 +364,7 @@ async def analyze(
         raise HTTPException(status_code=400, detail="Please upload a file or provide text")
 
     chosen = _choose_brains(brains, True)
-    prompts = {b: _brain_prompt(brief, extracted, b) for b in chosen}
-
-    # Compose one batched chat turn (multi brain in one go keeps cost lower)
-    joined = "\n\n".join([f"## {b}\n{prompts[b]}" for b in chosen])
+    joined = "\n\n".join([f"## {b}\n{_brain_prompt(brief, extracted, b)}" for b in chosen])
     messages = [{"role":"user","content": joined}]
 
     try:
@@ -371,7 +380,7 @@ async def analyze(
         "meta": {"provider": "openrouter", "model": OPENROUTER_MODEL, "brains": chosen, "chars": len(extracted)},
     }
 
-# ---------- Premium Chat ----------
+# ---------- Chat (Premium unlimited, Pro+ limited) ----------
 def _is_premium(user: User) -> bool:
     email = (user.email or "").lower()
     return email in ADMIN_EMAILS or email in PREMIUM_EMAILS
@@ -449,8 +458,9 @@ async def chat_send(
     db: Session = Depends(get_db),
 ):
     tier = _user_tier(current_user)
+    # access & caps
     if _is_premium(current_user):
-        pass  # unlimited chat
+        pass
     elif _is_pro_plus(current_user):
         ok, used, limit, reset_at, _ = _check_and_increment_usage(db, current_user, endpoint="chat")
         if not ok:
@@ -458,7 +468,7 @@ async def chat_send(
     else:
         raise HTTPException(status_code=403, detail="Chat is available on Pro+ (limited) and Premium.")
 
-    # Log a chat usage event (separate from cap check above)
+    # Log chat usage (separate event)
     db.add(UsageLog(user_id=getattr(current_user, "id", 0) or 0, timestamp=datetime.utcnow(), endpoint="chat", status="ok"))
     db.commit()
 
@@ -522,7 +532,7 @@ def chat_sessions(current_user: User = Depends(get_current_user), db: Session = 
     )
     return [{"id": s.id, "title": s.title or f"Chat {s.id}", "created_at": s.created_at.isoformat()+"Z"} for s in rows]
 
-# ---------- Admin Usage endpoints (unchanged) ----------
+# ---------- Admin Usage ----------
 def _require_admin(user: User):
     if _user_tier(user) != "admin":
         raise HTTPException(status_code=403, detail="Admin only")
@@ -567,7 +577,7 @@ def admin_usage(
     series = [series_map[d] for d in day_keys]
     return {"from": since.isoformat() + "Z","to": now.isoformat() + "Z","days": days,"series": series,"totals": totals}
 
-# ---------- Admin roster & helpers (unchanged essentials) ----------
+# ---------- Admin Users (summary + roster) ----------
 from pydantic import BaseModel
 
 class SetPaidPayload(BaseModel):
@@ -585,7 +595,7 @@ def admin_users_set_paid(
     if not email_l:
         raise HTTPException(status_code=400, detail="email required")
     if email_l in ADMIN_EMAILS or email_l in PREMIUM_EMAILS:
-        raise HTTPException(status_code=400, detail="This user is managed via env (ADMIN_EMAILS/PREMIUM_EMAILS)." )
+        raise HTTPException(status_code=400, detail="This user is managed via env (ADMIN_EMAILS/PREMIUM_EMAILS).")
     u = db.query(User).filter(func.lower(User.email) == email_l).first()
     if not u:
         raise HTTPException(status_code=404, detail="User not found")
@@ -602,14 +612,19 @@ def admin_users_summary(
 ):
     _require_admin(current_user)
     users: List[User] = db.query(User).all()
-    total = len(users); demo = pro = premium = 0
+    total = len(users)
+    demo = pro = pro_plus = premium = 0
     for u in users:
         e = (getattr(u,"email","") or "").lower()
-        tier = "premium" if (e in ADMIN_EMAILS or e in PREMIUM_EMAILS) else ("pro" if bool(getattr(u,"is_paid",False)) else "demo")
-        if tier == "premium": premium += 1
-        elif tier == "pro": pro += 1
-        else: demo += 1
-    return {"total_users": total, "demo": demo, "pro": pro, "premium": premium}
+        if e in ADMIN_EMAILS or e in PREMIUM_EMAILS:
+            premium += 1
+        elif e in PRO_PLUS_EMAILS or getattr(u, "plan_tier", "") == "pro_plus":
+            pro_plus += 1
+        elif bool(getattr(u,"is_paid",False)):
+            pro += 1
+        else:
+            demo += 1
+    return {"total_users": total, "demo": demo, "pro": pro, "pro_plus": pro_plus, "premium": premium}
 
 @app.get("/api/admin/users/roster")
 def admin_users_roster_view(
@@ -678,7 +693,14 @@ def admin_users_roster_view(
     for u in users:
         uid = int(getattr(u, "id", 0) or 0)
         email = getattr(u, "email", "") or ""
-        tier = "premium" if (email.lower() in ADMIN_EMAILS or email.lower() in PREMIUM_EMAILS) else ("pro" if bool(getattr(u,"is_paid",False)) else "demo")
+        if email.lower() in ADMIN_EMAILS or email.lower() in PREMIUM_EMAILS:
+            tier = "premium"
+        elif email.lower() in PRO_PLUS_EMAILS or getattr(u, "plan_tier", "") == "pro_plus":
+            tier = "pro_plus"
+        elif bool(getattr(u,"is_paid",False)):
+            tier = "pro"
+        else:
+            tier = "demo"
         created = getattr(u, "created_at", None)
         s = stats.get(uid, {}) if uid else {}
         items.append({
@@ -712,7 +734,7 @@ def debug_routers():
             out.append({"path": path, "methods": methods})
     return out
 
-# ---------- Other routers ----------
+# ---------- Include other routers ----------
 try:
     from routes_public_config import router as public_cfg_router
     app.include_router(public_cfg_router)
