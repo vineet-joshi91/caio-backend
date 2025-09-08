@@ -12,10 +12,10 @@ COUNTRY_HEADER_CANDIDATES = [
 
 # ---- Env-configurable knobs ---------------------------------------------------
 PRO_PRICE_INR      = int(os.getenv("PRO_PRICE_INR", "1999"))
-PRO_PRICE_USD      = int(os.getenv("PRO_PRICE_USD", "49"))
+PRO_PRICE_USD      = int(os.getenv("PRO_PRICE_USD", "25"))
 
-PRO_PLUS_PRICE_INR = int(os.getenv("PRO_PLUS_PRICE_INR", "2999"))  # Limited Chat
-PRO_PLUS_PRICE_USD = int(os.getenv("PRO_PLUS_PRICE_USD", "59"))
+PRO_PLUS_PRICE_INR = int(os.getenv("PRO_PLUS_PRICE_INR", "3999"))  # Limited Chat
+PRO_PLUS_PRICE_USD = int(os.getenv("PRO_PLUS_PRICE_USD", "49"))
 
 PREMIUM_PRICE_INR  = int(os.getenv("PREMIUM_PRICE_INR", "7999"))
 PREMIUM_PRICE_USD  = int(os.getenv("PREMIUM_PRICE_USD", "99"))
