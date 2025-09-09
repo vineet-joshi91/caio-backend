@@ -453,32 +453,45 @@ async def chat_send(
     request: Request,
     message: str = Form(...),
     session_id: Optional[int] = Form(None),
-    file: Optional[UploadFile] = File(None),
+    files: Optional[List[UploadFile]] = File(None),   # <- was: file: Optional[UploadFile]
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     tier = _user_tier(current_user)
-    # access & caps
+
+    # Access control (same as before)
     if _is_premium(current_user):
         pass
     elif _is_pro_plus(current_user):
         ok, used, limit, reset_at, _ = _check_and_increment_usage(db, current_user, endpoint="chat")
         if not ok:
             return _limit_response(used, int(limit or 0), reset_at, "pro_plus", "chat")
+        # Pro+ restriction: allow only 1 file per message
+        if files and len(files) > 1:
+            raise HTTPException(status_code=403, detail="Pro+ can attach one file per message. Upgrade to Premium for multiple attachments.")
     else:
         raise HTTPException(status_code=403, detail="Chat is available on Pro+ (limited) and Premium.")
 
-    # Log chat usage (separate event)
+    # Log chat usage (separate event – keep existing line)
     db.add(UsageLog(user_id=getattr(current_user, "id", 0) or 0, timestamp=datetime.utcnow(), endpoint="chat", status="ok"))
     db.commit()
 
     sess = _ensure_session(db, getattr(current_user, "id", 0) or 0, session_id, title_hint=message[:60])
 
+    # Build context from multiple files
     context = ""
     try:
-        context = (await _extract_text(file)).strip() if file else ""
+        if files:
+            parts = []
+            for f in files[:8]:  # soft cap of 8 files per message
+                name = (f.filename or "file").strip()
+                text = (await _extract_text(f)).strip()
+                if text:
+                    parts.append(f"\n\n---\n[FILE: {name}]\n{text[:40000]}")  # safety cap per file
+            context = "".join(parts)
     except Exception as e:
-        logger.warning("File read failed: %s", e); context = ""
+        logger.warning("File read failed: %s", e)
+        context = ""
 
     primary_role = _pick_primary_cxo(f"{context}\n\n{message}")
     sys_prompt = _compose_premium_system_prompt(primary_role)
@@ -487,7 +500,7 @@ async def chat_send(
     for m in _history(db, sess.id, getattr(current_user, "id", 0) or 0, limit=20):
         msgs.append({"role": m.role, "content": m.content})
     if context:
-        msgs.append({"role":"system","content": f"[DOCUMENT EXCERPT]\n{context[:8000]}"})
+        msgs.append({"role":"system","content": f"[DOCUMENT EXCERPTS]\n{context[:120000]}"} )
     msgs.append({"role":"user","content": message})
 
     _save_msg(db, sess.id, "user", message)
@@ -500,7 +513,6 @@ async def chat_send(
 
     _save_msg(db, sess.id, "assistant", reply)
     return {"session_id": sess.id, "assistant": reply, "meta": {"provider":"openrouter","model":OPENROUTER_MODEL,"tier":tier}}
-
 @app.get("/api/chat/history")
 def chat_history(
     session_id: int = Query(...),
