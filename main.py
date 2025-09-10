@@ -170,7 +170,7 @@ def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depend
         pass
     if changed: db.commit()
 
-    token = create_access_token({"sub": email})
+    token = create_access_token(email)
     return {"access_token": token, "token_type": "bearer"}
 
 @app.get("/api/profile")
