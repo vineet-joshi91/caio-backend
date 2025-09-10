@@ -487,3 +487,9 @@ try:
     app.include_router(admin_metrics_router)  # already prefixed /api/admin in that file
 except Exception:
     if DEBUG: logger.info("admin_metrics_routes not included")
+
+try:
+    from payment_routes import router as payment_router
+    app.include_router(payment_router)
+except Exception:
+    if DEBUG: logger.info("payment_routes not included")

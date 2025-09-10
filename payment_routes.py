@@ -38,7 +38,7 @@ PAY_INTERVAL = int(os.getenv("PAY_INTERVAL", "1"))   # plan.interval
 PAY_INTERVAL_TEXT = os.getenv("PAY_INTERVAL_TEXT", "every 1 monthly")
 
 # Pricing via env JSON (currency -> {amount_major, symbol})
-# Example: {"INR":{"amount_major":2999,"symbol":"₹"},"USD":{"amount_major":49,"symbol":"$"}}
+# Example: {"INR":{"amount_major":1999,"symbol":"₹"},"USD":{"amount_major":25,"symbol":"$"}}
 def _load_pricing() -> Dict[str, Dict[str, Any]]:
     raw = os.getenv("PRICING_JSON", "").strip()
     if raw:
@@ -48,8 +48,8 @@ def _load_pricing() -> Dict[str, Dict[str, Any]]:
         except Exception as e:
             log.warning("Invalid PRICING_JSON, using defaults. %s", e)
     return {
-        "INR": {"amount_major": 2999, "symbol": "₹"},
-        "USD": {"amount_major": 49,   "symbol": "$"},
+        "INR": {"amount_major": 1999, "symbol": "₹"},
+        "USD": {"amount_major": 25,   "symbol": "$"},
     }
 
 PRICING = _load_pricing()
@@ -138,9 +138,11 @@ def ping():
 def subscription_config(request: Request, currency: Optional[str] = None):
     """
     Boot payload for the frontend.
+
+    IMPORTANT: Includes `pay` wrapper so TS like `config.pay.pricing` works.
     """
     display_currency = _pick_currency(request, currency)
-    return {
+    payload = {
         "mode": MODE,
         "key_id": RZP_KEY_ID or None,
         "has_secret": HAS_SECRET,
@@ -148,7 +150,8 @@ def subscription_config(request: Request, currency: Optional[str] = None):
         "defaultCurrency": display_currency,
         "pricing": PRICING,
     }
-# (keeps the shape your page expects)  # <-- existing behavior preserved
+    # Back-compat for older code + new typed `pay` wrapper
+    return {**payload, "pay": payload}
 
 class CreateBody(BaseModel):
     currency: Optional[str] = None
@@ -192,7 +195,6 @@ def create_subscription(
     except ServerError as e:
         msg = getattr(e, "args", [str(e)])[0]
         raise HTTPException(502, f"Razorpay server error: {msg}") from e
-# (your file already had /subscription/create; we tightened & added key_id) :contentReference[oaicite:2]{index=2}
 
 # ----- Optional verify endpoint (UI can call after handler; webhook is source of truth)
 
