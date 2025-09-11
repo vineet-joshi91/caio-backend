@@ -90,7 +90,9 @@ def ready():
     return {"ready": True, "db_ready": DB_READY, "time": datetime.utcnow().isoformat() + "Z"}
 
 # ---------------- Tiers & limits ----------------
-ADMIN_EMAILS   = {e.strip().lower() for e in os.getenv("ADMIN_EMAILS", "vineetpjoshi.71@gmail.com").split(",") if e.strip()}
+ADMIN_EMAILS = set(e.strip().lower() for e in os.getenv("ADMIN_EMAILS", "").split(",") if e.strip())
+def is_admin_email(email: str) -> bool:
+    return email.lower() in ADMIN_EMAILS
 PREMIUM_EMAILS = {e.strip().lower() for e in os.getenv("PREMIUM_EMAILS", "").split(",") if e.strip()}
 
 # Analyzer/demo caps (existing)
