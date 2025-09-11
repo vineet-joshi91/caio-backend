@@ -36,8 +36,15 @@ PAY_PERIOD = os.getenv("PAY_PERIOD", "monthly")      # plan.period
 PAY_INTERVAL = int(os.getenv("PAY_INTERVAL", "1"))   # plan.interval
 PAY_INTERVAL_TEXT = os.getenv("PAY_INTERVAL_TEXT", "every 1 monthly")
 
-# Pricing via env JSON (currency -> {amount_major, symbol})
-# Example: {"INR":{"amount_major":1999,"symbol":"₹"},"USD":{"amount_major":25,"symbol":"$"}}
+# Supported tiers
+SUPPORTED_PLANS = ("pro", "pro_plus", "premium")
+
+# Pricing via env JSON
+# Old shape (still supported, maps to 'pro'): {"INR":{"amount_major":1999,"symbol":"₹"},"USD":{"amount_major":25,"symbol":"$"}}
+# New shape (preferred): {
+#   "INR":{"symbol":"₹","pro":1999,"pro_plus":3999,"premium":7999},
+#   "USD":{"symbol":"$","pro":25,"pro_plus":49,"premium":99}
+# }
 def _load_pricing() -> Dict[str, Dict[str, Any]]:
     raw = os.getenv("PRICING_JSON", "").strip()
     if raw:
@@ -47,7 +54,7 @@ def _load_pricing() -> Dict[str, Dict[str, Any]]:
         except Exception as e:
             log.warning("Invalid PRICING_JSON, using defaults. %s", e)
     return {
-        "INR": {"amount_major": 1999, "symbol": "₹"},
+        "INR": {"amount_major": 1999, "symbol": "₹"},  # legacy single-price -> pro
         "USD": {"amount_major": 25,   "symbol": "$"},
     }
 
@@ -61,8 +68,8 @@ if razorpay and RZP_KEY_ID and RZP_SECRET:
 else:
     log.warning("Razorpay client not initialized (missing keys or library).")
 
-# In-memory cache: (currency, amount, period, interval) -> plan_id
-PLAN_CACHE: Dict[Tuple[str, int, str, int], str] = {}
+# In-memory cache: (plan, currency, amount, period, interval) -> plan_id
+PLAN_CACHE: Dict[Tuple[str, str, int, str, int], str] = {}
 
 # ------------------------- Helpers ------------------------------------------
 
@@ -94,32 +101,56 @@ def _pick_currency(request: Request, explicit: Optional[str]) -> str:
         return DEFAULT_CURRENCY
     return next(iter(ALLOWED_CURRENCIES))
 
-def _pricing_for(currency: str) -> Dict[str, Any]:
-    cfg = PRICING.get(currency.upper())
-    if not cfg or "amount_major" not in cfg:
+def _pricing_for(currency: str, plan: str) -> Tuple[int, str]:
+    """
+    Returns (amount_major, symbol) for given currency and plan.
+    Back-compat: if only amount_major is provided, treat it as the 'pro' amount.
+    """
+    c = currency.upper()
+    cfg = PRICING.get(c)
+    if not cfg:
         raise HTTPException(500, f"Pricing missing for {currency}")
-    return cfg
 
-def _ensure_plan(currency: str, amount_major: int) -> str:
-    key = (currency, amount_major, PAY_PERIOD, PAY_INTERVAL)
+    symbol = cfg.get("symbol") or ("₹" if c == "INR" else "$")
+
+    # New shape: per-plan ints present
+    if any(k in cfg for k in SUPPORTED_PLANS):
+        if plan not in SUPPORTED_PLANS:
+            raise HTTPException(400, f"Unsupported plan: {plan}")
+        amount = cfg.get(plan)
+        if not isinstance(amount, int):
+            raise HTTPException(500, f"Pricing missing for {currency}/{plan}")
+        return int(amount), symbol
+
+    # Old shape: single amount_major -> treat as 'pro'
+    amt = cfg.get("amount_major")
+    if isinstance(amt, int):
+        if plan != "pro":
+            log.warning("Per-plan pricing not configured; mapping plan=%s -> pro for currency=%s", plan, c)
+        return int(amt), symbol
+
+    raise HTTPException(500, f"Pricing invalid for {currency}")
+
+def _ensure_plan(currency: str, amount_major: int, plan: str) -> str:
+    key = (plan, currency, amount_major, PAY_PERIOD, PAY_INTERVAL)
     if key in PLAN_CACHE:
         return PLAN_CACHE[key]
     if not _rzp:
         raise HTTPException(503, "Razorpay not initialized on server.")
     try:
-        plan = _rzp.plan.create(
+        plan_obj = _rzp.plan.create(
             {
                 "period": PAY_PERIOD,
                 "interval": PAY_INTERVAL,
                 "item": {
-                    "name": f"CAIO Pro ({currency})",
+                    "name": f"CAIO {plan.replace('_','+').title()} ({currency})",
                     "amount": amount_major * 100,  # subunits
                     "currency": currency,
                 },
             }
         )
-        PLAN_CACHE[key] = plan["id"]
-        return plan["id"]
+        PLAN_CACHE[key] = plan_obj["id"]
+        return plan_obj["id"]
     except BadRequestError as e:
         msg = getattr(e, "args", [str(e)])[0]
         raise HTTPException(400, f"Plan create failed: {msg}") from e
@@ -137,8 +168,8 @@ def ping():
 def subscription_config(request: Request, currency: Optional[str] = None):
     """
     Boot payload for the frontend.
-
-    IMPORTANT: Includes `pay` wrapper so TS like `config.pay.pricing` works.
+    Returns the raw PRICING table (old or new shape) and a defaultCurrency,
+    plus a `pay` wrapper for older TS that expects config.pay.pricing.
     """
     display_currency = _pick_currency(request, currency)
     payload = {
@@ -149,10 +180,10 @@ def subscription_config(request: Request, currency: Optional[str] = None):
         "defaultCurrency": display_currency,
         "pricing": PRICING,
     }
-    # Back-compat for older code + new typed `pay` wrapper
     return {**payload, "pay": payload}
 
 class CreateBody(BaseModel):
+    plan: Optional[str] = "pro"           # "pro" | "pro_plus" | "premium"
     currency: Optional[str] = None
     notes: Optional[Dict[str, Any]] = None
 
@@ -164,24 +195,38 @@ def create_subscription(
 ):
     if MODE != "razorpay":
         raise HTTPException(400, "Only Razorpay mode is implemented.")
+
+    # 1) Resolve currency and plan
+    plan = (body.plan or "pro").lower()
+    if plan not in SUPPORTED_PLANS:
+        raise HTTPException(400, f"Unsupported plan: {plan}")
     currency = _pick_currency(request, body.currency)
-    p = _pricing_for(currency)
-    amount_major = int(p["amount_major"])
 
-    plan_id = _ensure_plan(currency, amount_major)
+    # 2) Resolve amount & symbol for this plan
+    amount_major, symbol = _pricing_for(currency, plan)
 
-    # propagate email to notes to help webhook lookup
+    # 3) Ensure (or create) a Razorpay plan for this (plan,currency,amount)
+    plan_id = _ensure_plan(currency, amount_major, plan)
+
+    # 4) Propagate email to notes to ease webhook mapping
     notes = dict(body.notes or {})
     notes.setdefault("email", getattr(current_user, "email", ""))
 
     try:
         sub = _rzp.subscription.create(
-            {"plan_id": plan_id, "total_count": 12, "customer_notify": 1, "notes": notes}
+            {
+                "plan_id": plan_id,
+                "total_count": 12,
+                "customer_notify": 1,
+                "notes": notes,
+            }
         )
         return {
             "key_id": RZP_KEY_ID or None,
             "currency": currency,
+            "symbol": symbol,
             "amount_major": amount_major,
+            "plan": plan,
             "plan_id": plan_id,
             "subscription_id": sub.get("id"),
             "status": sub.get("status"),
@@ -292,9 +337,13 @@ async def razorpay_webhook(request: Request, db: Session = Depends(get_db)):
 
     return {"ok": True, "email": email, "event": etype}
 
+# -------------------------- Legacy shim for old frontend ---------------------
+
 @router.post("/create-checkout-session")
 def legacy_create_checkout_session(request: Request, current_user: User = Depends(get_current_user)):
-    # Reuse the real creator
-    data = create_subscription(request, CreateBody(), current_user)
-    # Frontend expects `url`
+    """
+    Backward-compat: older frontend called /api/payments/create-checkout-session without a plan.
+    We map it to 'pro' so nothing breaks, and return the shape with 'url'.
+    """
+    data = create_subscription(request, CreateBody(plan="pro"), current_user)
     return {"url": data.get("short_url"), **{k: v for k, v in data.items() if k != "short_url"}}
