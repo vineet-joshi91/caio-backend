@@ -8,9 +8,8 @@ import asyncio
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Request, Query
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 
@@ -104,17 +103,35 @@ FREE_BRAINS          = int(os.getenv("FREE_BRAINS", "2"))
 FREE_CHAT_MSGS_PER_DAY     = int(os.getenv("FREE_CHAT_MSGS_PER_DAY", "3"))
 FREE_CHAT_UPLOADS_PER_DAY  = int(os.getenv("FREE_CHAT_UPLOADS_PER_DAY", "3"))
 
+PRO_PLUS_EMAILS = {e.strip().lower() for e in os.getenv("PRO_PLUS_EMAILS", "").split(",") if e.strip()}
+PREMIUM_EMAILS   = {e.strip().lower() for e in os.getenv("PREMIUM_EMAILS", "").split(",") if e.strip()}
+
 def _user_tier(u: User) -> str:
+    """
+    Resolve a user's tier. Priority:
+    1) explicit u.tier if present
+    2) ADMIN_EMAILS -> admin
+    3) PRO_PLUS_EMAILS -> pro_plus
+    4) PREMIUM_EMAILS -> premium
+    5) legacy is_paid flag -> pro
+    6) fallback -> demo
+    """
     email = (getattr(u, "email", "") or "").lower()
+
+    # explicit field if your model stores it
+    explicit = getattr(u, "tier", None)
+    if isinstance(explicit, str) and explicit in ("admin", "premium", "pro_plus", "pro", "demo"):
+        return explicit
+
     if not email:
         return "demo"
     if email in ADMIN_EMAILS:
         return "admin"
+    if email in PRO_PLUS_EMAILS:
+        return "pro_plus"
     if email in PREMIUM_EMAILS:
         return "premium"
-    # legacy flag if you still store it:
-    if getattr(u, "is_paid", False) is True:
-        # treat paid-but-not-premium as "pro" (Pro+ should be via PREMIUM_EMAILS)
+    if getattr(u, "is_paid", False):
         return "pro"
     return "demo"
 
@@ -123,7 +140,7 @@ def _is_admin(u: User) -> bool:
 
 def _is_premium_or_plus(u: User) -> bool:
     t = _user_tier(u)
-    return t in ("admin", "premium")  # Pro+ emails should be in PREMIUM_EMAILS
+    return t in ("admin", "premium", "pro_plus")
 
 # ---------- usage helpers ----------
 def _today_bounds_utc() -> Tuple[datetime, datetime]:
@@ -182,9 +199,33 @@ def _check_and_increment_usage(db: Session, user: User, endpoint: str, plan: Opt
 
 # ---------------- Auth ----------------
 @app.post("/api/login")
-def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
-    email = form_data.username.strip().lower()
-    password = form_data.password or ""
+async def login(request: Request, db: Session = Depends(get_db)):
+    """
+    Accept BOTH form (application/x-www-form-urlencoded) and JSON bodies.
+    Keeps signup flow (which posts JSON) working alongside OAuth2-style form login.
+    """
+    email = ""
+    password = ""
+    ctype = (request.headers.get("content-type") or "").lower()
+
+    try:
+        if ctype.startswith("application/json"):
+            data = await request.json()
+            email = (data.get("username") or "").strip().lower()
+            password = data.get("password") or ""
+        else:
+            form = await request.form()
+            email = (form.get("username") or "").strip().lower()
+            password = form.get("password") or ""
+    except Exception:
+        # Fallback to parsing raw body as JSON if form parsing fails
+        try:
+            data = await request.json()
+            email = (data.get("username") or "").strip().lower()
+            password = data.get("password") or ""
+        except Exception:
+            pass
+
     if not email or not password:
         raise HTTPException(status_code=400, detail="Email and password required")
 
@@ -207,6 +248,12 @@ def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depend
 
     token = create_access_token(email)
     return {"access_token": token, "token_type": "bearer"}
+
+@app.post("/api/logout")
+def logout(response: Response):
+    # Best-effort: clear a non-HttpOnly cookie named "token" if you set one
+    response.delete_cookie("token", path="/")
+    return {"ok": True}
 
 @app.get("/api/profile")
 def profile(current_user: User = Depends(get_current_user)):
@@ -326,7 +373,7 @@ async def analyze(
         # plan_or_reset is reset_at here
         return _limit_response(used, limit, plan_or_reset, _user_tier(current_user))
 
-    is_paid = _user_tier(current_user) in ("admin", "premium", "pro")
+    is_paid = _user_tier(current_user) in ("admin", "premium", "pro_plus", "pro")
     chosen = _choose_brains(brains, is_paid)
 
     extracted = ""
@@ -392,7 +439,7 @@ async def chat_send(
     uid = getattr(current_user, "id", 0) or 0
 
     # Free preview caps for Demo/Pro; unlimited for Premium/Admin
-    if tier in ("demo", "pro"):
+    if tier not in ("admin", "premium", "pro_plus"):
         # count message send cap
         used = _count_usage(db, uid, "chat")
         if used >= FREE_CHAT_MSGS_PER_DAY:
