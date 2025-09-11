@@ -1,8 +1,11 @@
-# main.py
+# main.py (CAIO Backend) — resilient startup + intact routes
+
 import os, json, logging, traceback, re
 from typing import Optional, List, Tuple
 from datetime import datetime, timedelta
 from io import BytesIO
+import asyncio
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Request, Query
 from fastapi.responses import JSONResponse
@@ -19,8 +22,33 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("caio")
 DEBUG = os.getenv("DEBUG", "0").lower() in ("1", "true", "yes")
 
-app = FastAPI(title="CAIO Backend", version="0.4.0")
-init_db()
+# ---------------------------------------------------------------------
+# Resilient startup: warm DB on lifespan instead of crashing on import
+# ---------------------------------------------------------------------
+
+DB_READY = False
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    Warm up database connections *without* crashing the process.
+    Handles Render cold starts / transient Neon connection issues.
+    """
+    global DB_READY
+    tries = int(os.getenv("DB_WARMUP_TRIES", "20"))
+    delay = float(os.getenv("DB_WARMUP_DELAY", "1.5"))
+    for i in range(tries):
+        try:
+            init_db()  # existing initializer
+            DB_READY = True
+            break
+        except Exception as e:
+            logger.warning("init_db attempt %s/%s failed: %s", i + 1, tries, e)
+            await asyncio.sleep(delay)
+    # Keep serving even if DB isn't ready yet; requests can succeed once DB comes up
+    yield
+
+app = FastAPI(title="CAIO Backend", version="0.4.0", lifespan=lifespan)
 
 # ---------------- CORS ----------------
 ALLOWED_ORIGINS = [
@@ -48,13 +76,18 @@ def cors_preflight(path: str):
     return JSONResponse({"ok": True})
 
 # ---------------- Health ----------------
+@app.get("/")
+def root():
+    return {"ok": True, "service": "caio-backend", "version": "0.4.0"}
+
 @app.get("/api/health")
 def health():
     return {"status": "ok", "version": "0.4.0"}
 
 @app.get("/api/ready")
 def ready():
-    return {"ready": True, "time": datetime.utcnow().isoformat() + "Z"}
+    # Always respond 200 so Render doesn't kill the instance; report DB readiness flag
+    return {"ready": True, "db_ready": DB_READY, "time": datetime.utcnow().isoformat() + "Z"}
 
 # ---------------- Tiers & limits ----------------
 ADMIN_EMAILS   = {e.strip().lower() for e in os.getenv("ADMIN_EMAILS", "vineetpjoshi.71@gmail.com").split(",") if e.strip()}
