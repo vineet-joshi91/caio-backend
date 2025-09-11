@@ -291,3 +291,10 @@ async def razorpay_webhook(request: Request, db: Session = Depends(get_db)):
         raise HTTPException(500, "DB update failed")
 
     return {"ok": True, "email": email, "event": etype}
+
+@router.post("/create-checkout-session")
+def legacy_create_checkout_session(request: Request, current_user: User = Depends(get_current_user)):
+    # Reuse the real creator
+    data = create_subscription(request, CreateBody(), current_user)
+    # Frontend expects `url`
+    return {"url": data.get("short_url"), **{k: v for k, v in data.items() if k != "short_url"}}
