@@ -7,11 +7,12 @@ from io import BytesIO
 import asyncio
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Request, Query
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Request, Query, APIRouter
 from fastapi.responses import JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from sqlalchemy import func
+from pydantic import BaseModel
 
 # project modules
 from db import get_db, User, init_db, UsageLog, ChatSession, ChatMessage
@@ -248,6 +249,47 @@ async def login(request: Request, db: Session = Depends(get_db)):
 
     token = create_access_token(email)
     return {"access_token": token, "token_type": "bearer"}
+
+class SignupRequest(BaseModel):
+    name: Optional[str] = None
+    organization: Optional[str] = None
+    email: str
+    password: str
+
+@app.post("/api/signup")
+def signup(data: SignupRequest, db: Session = Depends(get_db)):
+    """Create a new Demo account."""
+    email = data.email.strip().lower()
+
+    # check if already exists
+    existing = db.query(User).filter(User.email == email).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="User already exists")
+
+    # create new user
+    user = User(
+        name=data.name or "",
+        organization=data.organization or "",
+        email=email,
+        hashed_password=get_password_hash(data.password),
+        tier="demo",       # new accounts start as demo
+        is_admin=False,
+        is_paid=False,
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+
+    # issue token immediately
+    token = create_access_token(email)
+    return {
+        "message": "Account created",
+        "email": user.email,
+        "tier": user.tier,
+        "access_token": token,
+        "token_type": "bearer",
+    }
+
 
 @app.post("/api/logout")
 def logout(response: Response):
