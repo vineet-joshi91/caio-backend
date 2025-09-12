@@ -250,29 +250,50 @@ async def login(request: Request, db: Session = Depends(get_db)):
     token = create_access_token(email)
     return {"access_token": token, "token_type": "bearer"}
 
-class SignupRequest(BaseModel):
-    name: Optional[str] = None
-    organization: Optional[str] = None
-    email: str
-    password: str
+# --- robust /api/signup: accepts JSON or form-data ---
+from typing import Optional
+from fastapi import Request, Form
 
 @app.post("/api/signup")
-def signup(data: SignupRequest, db: Session = Depends(get_db)):
-    """Create a new Demo account."""
-    email = data.email.strip().lower()
+async def signup(
+    request: Request,
+    name: Optional[str] = Form(None),
+    organization: Optional[str] = Form(None),
+    email: Optional[str] = Form(None),
+    password: Optional[str] = Form(None),
+    db: Session = Depends(get_db),
+):
+    """
+    Create a new Demo account.
+    Accepts EITHER application/json OR multipart/form-data.
+    JSON shape: { name?, organization?, email, password }
+    """
+    # If JSON, prefer JSON values
+    try:
+        if (request.headers.get("content-type") or "").lower().startswith("application/json"):
+            data = await request.json()
+            name = data.get("name") or name
+            organization = data.get("organization") or data.get("organisation") or organization
+            email = data.get("email") or email
+            password = data.get("password") or password
+    except Exception:
+        pass
 
-    # check if already exists
+    if not email or not password:
+        raise HTTPException(status_code=422, detail="email and password are required")
+
+    email = email.strip().lower()
+
     existing = db.query(User).filter(User.email == email).first()
     if existing:
         raise HTTPException(status_code=400, detail="User already exists")
 
-    # create new user
     user = User(
-        name=data.name or "",
-        organization=data.organization or "",
+        name=(name or "").strip(),
+        organization=(organization or "").strip(),
         email=email,
-        hashed_password=get_password_hash(data.password),
-        tier="demo",       # new accounts start as demo
+        hashed_password=get_password_hash(password),
+        tier="demo",
         is_admin=False,
         is_paid=False,
     )
@@ -280,7 +301,6 @@ def signup(data: SignupRequest, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(user)
 
-    # issue token immediately
     token = create_access_token(email)
     return {
         "message": "Account created",
@@ -289,7 +309,6 @@ def signup(data: SignupRequest, db: Session = Depends(get_db)):
         "access_token": token,
         "token_type": "bearer",
     }
-
 
 @app.post("/api/logout")
 def logout(response: Response):
