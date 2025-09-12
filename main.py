@@ -105,7 +105,6 @@ FREE_CHAT_MSGS_PER_DAY     = int(os.getenv("FREE_CHAT_MSGS_PER_DAY", "3"))
 FREE_CHAT_UPLOADS_PER_DAY  = int(os.getenv("FREE_CHAT_UPLOADS_PER_DAY", "3"))
 
 PRO_PLUS_EMAILS = {e.strip().lower() for e in os.getenv("PRO_PLUS_EMAILS", "").split(",") if e.strip()}
-PREMIUM_EMAILS   = {e.strip().lower() for e in os.getenv("PREMIUM_EMAILS", "").split(",") if e.strip()}
 
 def _user_tier(u: User) -> str:
     """
@@ -212,11 +211,11 @@ async def login(request: Request, db: Session = Depends(get_db)):
     try:
         if ctype.startswith("application/json"):
             data = await request.json()
-            email = (data.get("username") or "").strip().lower()
+            email = (data.get("email") or data.get("username") or "").strip().lower()
             password = data.get("password") or ""
         else:
             form = await request.form()
-            email = (form.get("username") or "").strip().lower()
+            email = (form.get("email") or form.get("username") or "").strip().lower()
             password = form.get("password") or ""
     except Exception:
         # Fallback to parsing raw body as JSON if form parsing fails
