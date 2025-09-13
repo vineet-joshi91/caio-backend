@@ -254,71 +254,66 @@ async def login(request: Request, db: Session = Depends(get_db)):
 # --- robust /api/signup: accepts JSON or form-data ---
 
 @app.post("/api/signup")
-async def signup(
-    request: Request,
-    name: Optional[str] = Form(None),
-    organization: Optional[str] = Form(None),
-    email: Optional[str] = Form(None),
-    password: Optional[str] = Form(None),
-    db: Session = Depends(get_db),
-):
+async def signup(request: Request, db: Session = Depends(get_db)):
     """
-    Create a new Demo account.
-    Accepts EITHER application/json OR multipart/form-data.
-    JSON shape: { name?, organization?/organisation?, email, password }
+    Create a new user account.
+    Accepts either JSON (application/json) or form-data (multipart/x-www-form-urlencoded).
+    Only uses columns that actually exist in db.py::User.
     """
-    # Prefer JSON if present
     try:
-        if (request.headers.get("content-type") or "").lower().startswith("application/json"):
+        email = ""
+        password = ""
+
+        # Accept JSON or form data
+        ct = (request.headers.get("content-type") or "").lower()
+        if "application/json" in ct:
             data = await request.json()
-            name = data.get("name") or name
-            organization = data.get("organization") or data.get("organisation") or organization
-            email = data.get("email") or email
-            password = data.get("password") or password
-    except Exception:
-        pass
+            email = (data.get("email") or "").strip().lower()
+            password = data.get("password") or ""
+        else:
+            form = await request.form()
+            email = ((form.get("email") or "")).strip().lower()
+            password = form.get("password") or ""
 
-    if not email or not password:
-        raise HTTPException(status_code=422, detail="email and password are required")
+        if not email or not password:
+            raise HTTPException(status_code=422, detail="email and password are required")
 
-    email = email.strip().lower()
+        # Reject obvious bad emails fast (optional)
+        if "@" not in email or "." not in email.split("@")[-1]:
+            raise HTTPException(status_code=422, detail="invalid email format")
 
-    try:
-        # fail fast if exists
-        if db.query(User).filter(User.email == email).first():
-            raise HTTPException(status_code=400, detail="User already exists")
+        # Hash the password with your existing util
+        hashed = get_password_hash(password)
 
+        # Create only the fields that actually exist in db.py::User
         user = User(
-            name=(name or "").strip(),
-            organization=(organization or "").strip(),
             email=email,
-            hashed_password=get_password_hash(password),
-            tier="demo",
+            hashed_password=hashed,
             is_admin=False,
             is_paid=False,
+            created_at=datetime.utcnow(),
         )
         db.add(user)
-        db.flush()    # catch constraint violations before commit
+        db.flush()   # surface constraint violations before commit
         db.commit()
         db.refresh(user)
-    except IntegrityError as e:
-        db.rollback()
-        # most likely unique(email) or not-null on a column
-        raise HTTPException(status_code=400, detail="Could not create user (duplicate or invalid data).")
-    except Exception as e:
-        db.rollback()
-        # log full traceback server-side; return sanitized detail
-        logger.error("signup failed: %s", traceback.format_exc())
-        raise HTTPException(status_code=500, detail="Signup failed on the server. Please try again.")
 
-    token = create_access_token(email)
-    return {
-        "message": "Account created",
-        "email": user.email,
-        "tier": user.tier,
-        "access_token": token,
-        "token_type": "bearer",
-    }
+        # If you normally issue a token on signup, do it here (reuse your existing util)
+        access_token = create_access_token({"sub": user.email})
+
+        return {"ok": True, "user": {"id": user.id, "email": user.email}, "access_token": access_token, "token_type": "bearer"}
+
+    except IntegrityError:
+        db.rollback()
+        # Likely duplicate email or constraint violation
+        raise HTTPException(status_code=400, detail="User already exists or invalid data.")
+    except HTTPException:
+        # re-raise intentional HTTP errors
+        raise
+    except Exception:
+        db.rollback()
+        logger.error("signup failed:\n%s", traceback.format_exc())
+        raise HTTPException(status_code=500, detail="Signup failed on the server. Please try again.")
 
 @app.post("/api/logout")
 def logout(response: Response):
@@ -646,3 +641,10 @@ try:
     app.include_router(payment_router)
 except Exception:
     if DEBUG: logger.info("payment_routes not included")
+
+try:
+    from contact_routes import router as contact_router
+    app.include_router(contact_router)  # exposes /api/contact
+except Exception:
+    if DEBUG:
+        logger.info("contact_routes not included")
