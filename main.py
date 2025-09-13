@@ -11,6 +11,7 @@ from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Req
 from fastapi.responses import JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy import func
 from pydantic import BaseModel
 
@@ -217,6 +218,7 @@ async def login(request: Request, db: Session = Depends(get_db)):
             form = await request.form()
             email = (form.get("email") or form.get("username") or "").strip().lower()
             password = form.get("password") or ""
+
     except Exception:
         # Fallback to parsing raw body as JSON if form parsing fails
         try:
@@ -250,8 +252,6 @@ async def login(request: Request, db: Session = Depends(get_db)):
     return {"access_token": token, "token_type": "bearer"}
 
 # --- robust /api/signup: accepts JSON or form-data ---
-from typing import Optional
-from fastapi import Request, Form
 
 @app.post("/api/signup")
 async def signup(
@@ -265,9 +265,9 @@ async def signup(
     """
     Create a new Demo account.
     Accepts EITHER application/json OR multipart/form-data.
-    JSON shape: { name?, organization?, email, password }
+    JSON shape: { name?, organization?/organisation?, email, password }
     """
-    # If JSON, prefer JSON values
+    # Prefer JSON if present
     try:
         if (request.headers.get("content-type") or "").lower().startswith("application/json"):
             data = await request.json()
@@ -283,22 +283,33 @@ async def signup(
 
     email = email.strip().lower()
 
-    existing = db.query(User).filter(User.email == email).first()
-    if existing:
-        raise HTTPException(status_code=400, detail="User already exists")
+    try:
+        # fail fast if exists
+        if db.query(User).filter(User.email == email).first():
+            raise HTTPException(status_code=400, detail="User already exists")
 
-    user = User(
-        name=(name or "").strip(),
-        organization=(organization or "").strip(),
-        email=email,
-        hashed_password=get_password_hash(password),
-        tier="demo",
-        is_admin=False,
-        is_paid=False,
-    )
-    db.add(user)
-    db.commit()
-    db.refresh(user)
+        user = User(
+            name=(name or "").strip(),
+            organization=(organization or "").strip(),
+            email=email,
+            hashed_password=get_password_hash(password),
+            tier="demo",
+            is_admin=False,
+            is_paid=False,
+        )
+        db.add(user)
+        db.flush()    # catch constraint violations before commit
+        db.commit()
+        db.refresh(user)
+    except IntegrityError as e:
+        db.rollback()
+        # most likely unique(email) or not-null on a column
+        raise HTTPException(status_code=400, detail="Could not create user (duplicate or invalid data).")
+    except Exception as e:
+        db.rollback()
+        # log full traceback server-side; return sanitized detail
+        logger.error("signup failed: %s", traceback.format_exc())
+        raise HTTPException(status_code=500, detail="Signup failed on the server. Please try again.")
 
     token = create_access_token(email)
     return {
