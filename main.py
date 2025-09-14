@@ -343,7 +343,7 @@ def public_config():
     return {"currency": currency, "plans": plans, "chat_preview": chat_preview}
 
 # ---------------- Analyzer (existing) ----------------
-DEFAULT_BRAINS_ORDER = ["CFO","COO","CHRO","CMO","CPO"]
+DEFAULT_BRAINS_ORDER = ["CFO","CHRO","COO","CMO","CPO"]
 
 def _choose_brains(requested: Optional[str], is_paid: bool) -> List[str]:
     if requested:
@@ -356,8 +356,8 @@ def _choose_brains(requested: Optional[str], is_paid: bool) -> List[str]:
 def _brain_prompt(brief: str, extracted: str, brain: str) -> str:
     role_map = {
         "CFO":"Chief Financial Officer — unit economics; revenue mix, margins, CCC, runway.",
-        "COO":"Chief Operating Officer — cost-to-serve & reliability; capacity, throughput, SLA.",
         "CHRO":"Chief Human Resources Officer — org effectiveness; attrition, engagement.",
+        "COO":"Chief Operating Officer — cost-to-serve & reliability; capacity, throughput, SLA.",
         "CMO":"Chief Marketing Officer — efficient growth; CAC/LTV, funnel, retention.",
         "CPO":"Chief People Officer — talent acquisition; pipeline, time-to-hire, QoH.",
     }
