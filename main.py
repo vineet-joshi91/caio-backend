@@ -143,6 +143,13 @@ def _is_premium_or_plus(u: User) -> bool:
     t = _user_tier(u)
     return t in ("admin", "premium", "pro_plus")
 
+def apply_tier_overrides(user):
+    allow = {e.strip().lower() for e in os.getenv("PRO_TEST_EMAILS", "").split(",") if e.strip()}
+    if user.email.lower() in allow:
+        user.tier = "pro"          # <- behave as Pro
+        user.is_paid = True        # optional; lets UI show paid styling
+    return user
+
 # ---------- usage helpers ----------
 def _today_bounds_utc() -> Tuple[datetime, datetime]:
     now = datetime.utcnow()
@@ -323,7 +330,19 @@ def logout(response: Response):
 
 @app.get("/api/profile")
 def profile(current_user: User = Depends(get_current_user)):
-    return {"email": current_user.email, "tier": _user_tier(current_user)}
+    tier = _user_tier(current_user)
+
+    # --- temporary override for testing ---
+    if current_user.email.lower() in {"testpro@123.com"}:
+        tier = "pro"
+
+    return {
+        "email": current_user.email,
+        "tier": tier,
+        "is_admin": getattr(current_user, "is_admin", False),
+        "is_paid": tier in {"pro", "pro_plus", "premium", "admin"},
+        "created_at": getattr(current_user, "created_at", None),
+    }
 
 # ---------------- Public config (pricing etc.) ----------------
 @app.get("/api/public-config")
