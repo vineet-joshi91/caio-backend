@@ -105,6 +105,19 @@ FREE_BRAINS          = int(os.getenv("FREE_BRAINS", "2"))
 FREE_CHAT_MSGS_PER_DAY     = int(os.getenv("FREE_CHAT_MSGS_PER_DAY", "3"))
 FREE_CHAT_UPLOADS_PER_DAY  = int(os.getenv("FREE_CHAT_UPLOADS_PER_DAY", "3"))
 
+# --- PRO QA testing toggles ---
+PRO_TEST_ENABLE = os.getenv("PRO_TEST_ENABLE", "1").lower() in ("1","true","yes")  # on by default during QA
+PRO_TEST_EMAILS = {e.strip().lower() for e in os.getenv("PRO_TEST_EMAILS", "").split(",") if e.strip()}
+# Keep your original hardcoded tester(s) here for now; add more if you like during QA:
+PRO_TEST_EMAILS_HARDCODE = {"testpro@123.com"}
+
+# --- PRO QA testing toggles ---
+PRO_TEST_ENABLE = os.getenv("PRO_TEST_ENABLE", "1").lower() in ("1","true","yes")  # on during QA
+PRO_TEST_EMAILS = {e.strip().lower() for e in os.getenv("PRO_TEST_EMAILS", "").split(",") if e.strip()}
+PRO_TEST_EMAILS_HARDCODE = {"testpro@123.com"}  # keep hardcoded tester during QA
+PRO_TEST_AUTO_CREATE = os.getenv("PRO_TEST_AUTO_CREATE", "1").lower() in ("1","true","yes")
+PRO_TEST_DEFAULT_PASSWORD = os.getenv("PRO_TEST_DEFAULT_PASSWORD", "testpro123")  # used if tester signs in first time
+
 def _user_tier(u: User) -> str:
     """
     Resolve a user's tier. Priority:
@@ -143,11 +156,21 @@ def _is_premium_or_plus(u: User) -> bool:
 
 def apply_tier_overrides(user: User) -> User:
     """
-    QA helper: force specified emails to behave as Pro (no code edit needed).
+    QA helper: for approved tester emails, *treat as Pro* (non-persistent).
+    Controlled by:
+      - PRO_TEST_ENABLE
+      - PRO_TEST_EMAILS (env) + PRO_TEST_EMAILS_HARDCODE (code)
     """
-    if (getattr(user, "email", "") or "").lower() in PRO_TEST_EMAILS:
-        user.tier = "pro"          # behave as Pro
-        user.is_paid = True        # optional; lets UI show paid styling
+    try:
+        if not PRO_TEST_ENABLE:
+            return user
+        email = (getattr(user, "email", "") or "").lower()
+        if email in PRO_TEST_EMAILS or email in PRO_TEST_EMAILS_HARDCODE:
+            # Do NOT write back to DB; keep this an in-memory override.
+            user.tier = "pro"
+            user.is_paid = True
+    except Exception:
+        pass
     return user
 
 # ---------- usage helpers ----------
@@ -210,12 +233,14 @@ def _check_and_increment_usage(db: Session, user: User, endpoint: str, plan: Opt
 async def login(request: Request, db: Session = Depends(get_db)):
     """
     Accept BOTH form (application/x-www-form-urlencoded) and JSON bodies.
-    Keeps signup flow (which posts JSON) working alongside OAuth2-style form login.
+    If a tester email signs in and doesn't exist, optionally auto-create (guarded by env).
+    Always returns the same token shape your frontend expects.
     """
     email = ""
     password = ""
     ctype = (request.headers.get("content-type") or "").lower()
 
+    # 1) Parse input (JSON or form)
     try:
         if ctype.startswith("application/json"):
             data = await request.json()
@@ -226,7 +251,6 @@ async def login(request: Request, db: Session = Depends(get_db)):
             email = (form.get("email") or form.get("username") or "").strip().lower()
             password = form.get("password") or ""
     except Exception:
-        # Fallback to parsing raw body as JSON if form parsing fails
         try:
             data = await request.json()
             email = (data.get("username") or "").strip().lower()
@@ -237,13 +261,33 @@ async def login(request: Request, db: Session = Depends(get_db)):
     if not email or not password:
         raise HTTPException(status_code=400, detail="Email and password required")
 
+    # 2) Lookup user (or optionally auto-create for approved tester emails)
     user = db.query(User).filter(User.email == email).first()
-    if not user:
-        raise HTTPException(status_code=401, detail="User not found")
-    if not verify_password(password, user.hashed_password):
-        raise HTTPException(status_code=401, detail="Incorrect email or password")
+    is_tester = PRO_TEST_ENABLE and (email in PRO_TEST_EMAILS or email in PRO_TEST_EMAILS_HARDCODE)
 
-    # keep flags in sync with env
+    if not user:
+        if is_tester and PRO_TEST_AUTO_CREATE:
+            # Auto-provision a test user with provided password; fallback to default if blank
+            from auth import get_password_hash
+            hashed = get_password_hash(password or PRO_TEST_DEFAULT_PASSWORD)
+            user = User(
+                email=email,
+                hashed_password=hashed,
+                is_admin=False,
+                is_paid=False,           # we won't persist paid; override handles Pro behavior
+                created_at=datetime.utcnow(),
+            )
+            db.add(user); db.commit(); db.refresh(user)
+        else:
+            raise HTTPException(status_code=401, detail="User not found")
+
+    # 3) Verify password (normal flow). If tester auto-created with default, allow that too.
+    if not verify_password(password, user.hashed_password):
+        # If tester and they used the default QA password, let them in.
+        if not (is_tester and PRO_TEST_DEFAULT_PASSWORD and verify_password(PRO_TEST_DEFAULT_PASSWORD, user.hashed_password)):
+            raise HTTPException(status_code=401, detail="Incorrect email or password")
+
+    # 4) Keep flags loosely in sync with env (do not unset existing is_paid)
     is_admin_now = email in ADMIN_EMAILS
     is_premium_now = email in PREMIUM_EMAILS
     changed = False
@@ -254,7 +298,11 @@ async def login(request: Request, db: Session = Depends(get_db)):
     if changed:
         db.commit()
 
-    token = create_access_token(email)  # keep token shape unchanged for your frontend
+    # 5) Apply *non-persistent* Pro override for QA testers
+    user = apply_tier_overrides(user)  # <— key line
+
+    # 6) Return token shape your frontend expects
+    token = create_access_token(email)
     return {"access_token": token, "token_type": "bearer"}
 
 # --- robust /api/signup: accepts JSON or form-data ---
@@ -338,6 +386,7 @@ def profile(current_user: User = Depends(get_current_user)):
         "created_at": getattr(current_user, "created_at", None),
     }
 
+
 # ---------------- Public config (pricing etc.) ----------------
 @app.get("/api/public-config")
 def public_config():
@@ -352,10 +401,10 @@ def public_config():
     currency = os.getenv("PAY_DEFAULT_CURRENCY", "INR").upper()
 
     # Pricing defaults aligned to your latest Pro-tier target:
-    PRO_PRICE_INR      = int(os.getenv("PRO_PRICE_INR", "2999"))
-    PRO_PRICE_USD      = int(os.getenv("PRO_PRICE_USD", "49"))
+    PRO_PRICE_INR      = int(os.getenv("PRO_PRICE_INR", "1999"))
+    PRO_PRICE_USD      = int(os.getenv("PRO_PRICE_USD", "25"))
     PRO_PLUS_PRICE_INR = int(os.getenv("PRO_PLUS_PRICE_INR", "3999"))
-    PRO_PLUS_PRICE_USD = int(os.getenv("PRO_PLUS_PRICE_USD", "69"))
+    PRO_PLUS_PRICE_USD = int(os.getenv("PRO_PLUS_PRICE_USD", "49"))
     PREMIUM_PRICE_INR  = int(os.getenv("PREMIUM_PRICE_INR", "7999"))
     PREMIUM_PRICE_USD  = int(os.getenv("PREMIUM_PRICE_USD", "99"))
 
