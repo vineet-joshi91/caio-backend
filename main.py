@@ -1,4 +1,4 @@
-# main.py (CAIO Backend) â€” resilient startup + intact routes
+# main.py (CAIO Backend) — resilient startup + intact routes
 
 import os, json, logging, traceback, re
 from typing import Optional, List, Tuple
@@ -347,7 +347,7 @@ def profile(current_user: User = Depends(get_current_user)):
 # ---------------- Public config (pricing etc.) ----------------
 @app.get("/api/public-config")
 def public_config():
-    # You already had this â€” preserved and simplified
+    # You already had this — preserved and simplified
     currency = os.getenv("PAY_DEFAULT_CURRENCY", "INR").upper()
     plans = {
         "pro":    {"price": {"USD": 25, "INR": 1999}.get(currency, 25)},
@@ -374,11 +374,11 @@ def _choose_brains(requested: Optional[str], is_paid: bool) -> List[str]:
 
 def _brain_prompt(brief: str, extracted: str, brain: str) -> str:
     role_map = {
-        "CFO":"Chief Financial Officer â€” unit economics; revenue mix, margins, CCC, runway.",
-        "CHRO":"Chief Human Resources Officer â€” org effectiveness; attrition, engagement.",
-        "COO":"Chief Operating Officer â€” cost-to-serve & reliability; capacity, throughput, SLA.",
-        "CMO":"Chief Marketing Officer â€” efficient growth; CAC/LTV, funnel, retention.",
-        "CPO":"Chief People Officer â€” talent acquisition; pipeline, time-to-hire, QoH.",
+        "CFO":"Chief Financial Officer — unit economics; revenue mix, margins, CCC, runway.",
+        "CHRO":"Chief Human Resources Officer — org effectiveness; attrition, engagement.",
+        "COO":"Chief Operating Officer — cost-to-serve & reliability; capacity, throughput, SLA.",
+        "CMO":"Chief Marketing Officer — efficient growth; CAC/LTV, funnel, retention.",
+        "CPO":"Chief People Officer — talent acquisition; pipeline, time-to-hire, QoH.",
     }
     role = role_map.get(brain, "Executive Advisor")
     return f"""
@@ -483,7 +483,7 @@ async def analyze(
 # ---------------- Chat endpoints ----------------
 def _compose_premium_system_prompt() -> str:
     return (
-        "You are CAIO â€” a pragmatic business & ops copilot. "
+        "You are CAIO — a pragmatic business & ops copilot. "
         "Answer clearly in Markdown. When files are provided, ground your answer on them."
     )
 
@@ -667,3 +667,4 @@ try:
 except Exception:
     if DEBUG:
         logger.info("contact_routes not included")
+5467
