@@ -91,32 +91,32 @@ def ready():
     return {"ready": True, "db_ready": DB_READY, "time": datetime.utcnow().isoformat() + "Z"}
 
 # ---------------- Tiers & limits ----------------
-ADMIN_EMAILS   = {e.strip().lower() for e in os.getenv("ADMIN_EMAILS", "").split(",") if e.strip()}
-PREMIUM_EMAILS = {e.strip().lower() for e in os.getenv("PREMIUM_EMAILS", "").split(",") if e.strip()}
-PRO_PLUS_EMAILS= {e.strip().lower() for e in os.getenv("PRO_PLUS_EMAILS", "").split(",") if e.strip()}
-PRO_TEST_EMAILS= {e.strip().lower() for e in os.getenv("PRO_TEST_EMAILS", "").split(",") if e.strip()}  # for QA
+ADMIN_EMAILS    = {e.strip().lower() for e in os.getenv("ADMIN_EMAILS", "").split(",") if e.strip()}
+PREMIUM_EMAILS  = {e.strip().lower() for e in os.getenv("PREMIUM_EMAILS", "").split(",") if e.strip()}
+PRO_PLUS_EMAILS = {e.strip().lower() for e in os.getenv("PRO_PLUS_EMAILS", "").split(",") if e.strip()}
+PRO_TEST_EMAILS = {e.strip().lower() for e in os.getenv("PRO_TEST_EMAILS", "").split(",") if e.strip()}  # for QA
 
-# Analyzer/demo caps (existing)
+# Analyzer/demo caps (legacy/free)
 FREE_QUERIES_PER_DAY = int(os.getenv("FREE_QUERIES_PER_DAY", "3"))
 FREE_UPLOADS         = int(os.getenv("FREE_UPLOADS", "3"))
 FREE_BRAINS          = int(os.getenv("FREE_BRAINS", "2"))
 
-# Chat preview caps for Demo/Pro
+# ---- Per-tier analyze limits (docs/day) ----
+# Pro defaults to 25/day; if you prefer your env PRO_QUERIES_PER_DAY, it will be used when PRO_ANALYZE_PER_DAY unset.
+PRO_ANALYZE_PER_DAY      = int(os.getenv("PRO_ANALYZE_PER_DAY", os.getenv("PRO_QUERIES_PER_DAY", "25")))
+PRO_PLUS_ANALYZE_PER_DAY = int(os.getenv("PRO_PLUS_ANALYZE_PER_DAY", "50"))
+DEMO_ANALYZE_PER_DAY     = int(os.getenv("DEMO_ANALYZE_PER_DAY",  str(FREE_QUERIES_PER_DAY)))  # default 3
+# Premium/Admin are unlimited for analyze
+
+# Chat preview caps for Demo/Pro (Pro+ & Premium/Admin unlimited in chat)
 FREE_CHAT_MSGS_PER_DAY     = int(os.getenv("FREE_CHAT_MSGS_PER_DAY", "3"))
 FREE_CHAT_UPLOADS_PER_DAY  = int(os.getenv("FREE_CHAT_UPLOADS_PER_DAY", "3"))
 
-# --- PRO QA testing toggles ---
-PRO_TEST_ENABLE = os.getenv("PRO_TEST_ENABLE", "1").lower() in ("1","true","yes")  # on by default during QA
-PRO_TEST_EMAILS = {e.strip().lower() for e in os.getenv("PRO_TEST_EMAILS", "").split(",") if e.strip()}
-# Keep your original hardcoded tester(s) here for now; add more if you like during QA:
-PRO_TEST_EMAILS_HARDCODE = {"testpro@123.com"}
-
-# --- PRO QA testing toggles ---
-PRO_TEST_ENABLE = os.getenv("PRO_TEST_ENABLE", "1").lower() in ("1","true","yes")  # on during QA
-PRO_TEST_EMAILS = {e.strip().lower() for e in os.getenv("PRO_TEST_EMAILS", "").split(",") if e.strip()}
-PRO_TEST_EMAILS_HARDCODE = {"testpro@123.com"}  # keep hardcoded tester during QA
-PRO_TEST_AUTO_CREATE = os.getenv("PRO_TEST_AUTO_CREATE", "1").lower() in ("1","true","yes")
-PRO_TEST_DEFAULT_PASSWORD = os.getenv("PRO_TEST_DEFAULT_PASSWORD", "testpro123")  # used if tester signs in first time
+# --- PRO QA testing toggles (deduped) ---
+PRO_TEST_ENABLE           = os.getenv("PRO_TEST_ENABLE", "1").lower() in ("1","true","yes")
+PRO_TEST_EMAILS_HARDCODE  = {"testpro@123.com"}  # keep hardcoded tester during QA
+PRO_TEST_AUTO_CREATE      = os.getenv("PRO_TEST_AUTO_CREATE", "1").lower() in ("1","true","yes")
+PRO_TEST_DEFAULT_PASSWORD = os.getenv("PRO_TEST_DEFAULT_PASSWORD", "testpro123")
 
 def _user_tier(u: User) -> str:
     """
@@ -130,7 +130,6 @@ def _user_tier(u: User) -> str:
     """
     email = (getattr(u, "email", "") or "").lower()
 
-    # explicit field if your model stores it
     explicit = getattr(u, "tier", None)
     if isinstance(explicit, str) and explicit in ("admin", "premium", "pro_plus", "pro", "demo"):
         return explicit
@@ -173,6 +172,17 @@ def apply_tier_overrides(user: User) -> User:
         pass
     return user
 
+def _analyze_limit_for_tier(tier: str) -> Optional[int]:
+    # None means unlimited
+    if tier in ("admin", "premium"):
+        return None
+    if tier == "pro_plus":
+        return PRO_PLUS_ANALYZE_PER_DAY
+    if tier == "pro":
+        return PRO_ANALYZE_PER_DAY
+    # demo / fallback
+    return DEMO_ANALYZE_PER_DAY
+
 # ---------- usage helpers ----------
 def _today_bounds_utc() -> Tuple[datetime, datetime]:
     now = datetime.utcnow()
@@ -207,26 +217,46 @@ def _limit_response(used: int, limit: int, reset_at: Optional[str], plan: str):
         "reset_at": reset_at,
     }, status_code=429)
 
-def _check_and_increment_usage(db: Session, user: User, endpoint: str, plan: Optional[str] = None,
-                               limit_override: Optional[int] = None) -> Tuple[bool, int, int, str]:
+def _check_and_increment_usage(
+    db: Session,
+    user: User,
+    endpoint: str,
+    plan: Optional[str] = None,
+    limit_override: Optional[int] = None,
+) -> Tuple[bool, int, int, str]:
+    """
+    Returns (allowed, used_or_next, limit, plan_or_reset_at)
+    - If allowed=False: used_or_next=used_count, plan_or_reset_at=reset_at
+    - If allowed=True:  used_or_next=used_count+1 (or 0 if unlimited), plan_or_reset_at=plan
+    """
     user_id = getattr(user, "id", 0) or 0
     plan = plan or _user_tier(user)
 
-    # Premium/Admin unlimited
-    if plan in ("admin", "premium"):
-        _log_usage(db, user_id, endpoint, "ok")
-        return True, 0, 0, plan
+    # ----- Unlimited tiers by endpoint -----
+    if endpoint == "analyze":
+        tier_limit = _analyze_limit_for_tier(plan) if limit_override is None else limit_override
+        if tier_limit is None:  # unlimited for analyze
+            _log_usage(db, user_id, endpoint, "ok")
+            return True, 0, 0, plan
 
-    # Pro gets analyzer caps; chat uses free preview caps
-    daily_limit = int(limit_override or (FREE_CHAT_MSGS_PER_DAY if endpoint == "chat" else FREE_QUERIES_PER_DAY))
+    elif endpoint == "chat":
+        # Premium/Admin/Pro+ get unlimited chat; Pro/Demo use preview cap
+        if plan in ("admin", "premium", "pro_plus") and limit_override is None:
+            _log_usage(db, user_id, endpoint, "ok")
+            return True, 0, 0, plan
+        tier_limit = limit_override if limit_override is not None else FREE_CHAT_MSGS_PER_DAY
 
+    else:
+        tier_limit = limit_override if limit_override is not None else FREE_QUERIES_PER_DAY
+
+    # ----- Count & enforce -----
     used = _count_usage(db, user_id, endpoint)
-    if used >= daily_limit:
+    if used >= tier_limit:
         _, end = _today_bounds_utc()
-        return False, used, daily_limit, end.isoformat() + "Z"
+        return False, used, tier_limit, end.isoformat() + "Z"
 
     _log_usage(db, user_id, endpoint, "ok")
-    return True, used + 1, daily_limit, plan
+    return True, used + 1, tier_limit, plan
 
 # ---------------- Auth ----------------
 @app.post("/api/login")
@@ -268,7 +298,6 @@ async def login(request: Request, db: Session = Depends(get_db)):
     if not user:
         if is_tester and PRO_TEST_AUTO_CREATE:
             # Auto-provision a test user with provided password; fallback to default if blank
-            from auth import get_password_hash
             hashed = get_password_hash(password or PRO_TEST_DEFAULT_PASSWORD)
             user = User(
                 email=email,
@@ -331,7 +360,7 @@ async def signup(request: Request, db: Session = Depends(get_db)):
         if not email or not password:
             raise HTTPException(status_code=422, detail="email and password are required")
 
-        # Reject obvious bad emails fast (optional)
+        # Basic format check
         if "@" not in email or "." not in email.split("@")[-1]:
             raise HTTPException(status_code=422, detail="invalid email format")
 
@@ -351,17 +380,15 @@ async def signup(request: Request, db: Session = Depends(get_db)):
         db.commit()
         db.refresh(user)
 
-        # If you normally issue a token on signup, do it here (reuse your existing util)
+        # Issue token on signup (consistent with login)
         access_token = create_access_token({"sub": user.email})
 
         return {"ok": True, "user": {"id": user.id, "email": user.email}, "access_token": access_token, "token_type": "bearer"}
 
     except IntegrityError:
         db.rollback()
-        # Likely duplicate email or constraint violation
         raise HTTPException(status_code=400, detail="User already exists or invalid data.")
     except HTTPException:
-        # re-raise intentional HTTP errors
         raise
     except Exception:
         db.rollback()
@@ -386,7 +413,6 @@ def profile(current_user: User = Depends(get_current_user)):
         "created_at": getattr(current_user, "created_at", None),
     }
 
-
 # ---------------- Public config (pricing etc.) ----------------
 @app.get("/api/public-config")
 def public_config():
@@ -400,7 +426,7 @@ def public_config():
     """
     currency = os.getenv("PAY_DEFAULT_CURRENCY", "INR").upper()
 
-    # Pricing defaults aligned to your latest Pro-tier target:
+    # Pricing defaults aligned to your Pro-tier target:
     PRO_PRICE_INR      = int(os.getenv("PRO_PRICE_INR", "1999"))
     PRO_PRICE_USD      = int(os.getenv("PRO_PRICE_USD", "25"))
     PRO_PLUS_PRICE_INR = int(os.getenv("PRO_PLUS_PRICE_INR", "3999"))
@@ -423,7 +449,7 @@ def public_config():
     }
     return {"currency": currency, "plans": plans, "chat_preview": chat_preview}
 
-# ---------------- Analyzer (existing) ----------------
+# ---------------- Analyzer ----------------
 DEFAULT_BRAINS_ORDER = ["CFO","CHRO","COO","CMO","CPO"]
 
 def _choose_brains(requested: Optional[str], is_paid: bool) -> List[str]:
@@ -514,6 +540,9 @@ async def analyze(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    # ✅ Treat QA testers as Pro BEFORE limits
+    current_user = apply_tier_overrides(current_user)
+
     allowed, used, limit, plan_or_reset = _check_and_increment_usage(db, current_user, endpoint="analyze")
     if not allowed:
         # plan_or_reset is reset_at here
@@ -585,7 +614,7 @@ async def chat_send(
     tier = _user_tier(current_user)
     uid = getattr(current_user, "id", 0) or 0
 
-    # Free preview caps for Demo/Pro; unlimited for Premium/Admin
+    # Free preview caps for Demo/Pro; unlimited for Premium/Admin/Pro+
     if tier not in ("admin", "premium", "pro_plus"):
         # count message send cap
         used = _count_usage(db, uid, "chat")
