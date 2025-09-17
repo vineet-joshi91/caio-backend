@@ -117,6 +117,8 @@ PRO_TEST_ENABLE           = os.getenv("PRO_TEST_ENABLE", "1").lower() in ("1","t
 PRO_TEST_EMAILS_HARDCODE  = {"testpro@123.com"}  # keep hardcoded tester during QA
 PRO_TEST_AUTO_CREATE      = os.getenv("PRO_TEST_AUTO_CREATE", "1").lower() in ("1","true","yes")
 PRO_TEST_DEFAULT_PASSWORD = os.getenv("PRO_TEST_DEFAULT_PASSWORD", "testpro123")
+PRO_PLUS_TEST_EMAILS = {e.strip().lower() for e in os.getenv("PRO_PLUS_TEST_EMAILS", "").split(",") if e.strip()}
+PREMIUM_TEST_EMAILS = {e.strip().lower() for e in os.getenv("PREMIUM_TEST_EMAILS", "").split(",") if e.strip()}
 
 def _user_tier(u: User) -> str:
     """
@@ -155,19 +157,38 @@ def _is_premium_or_plus(u: User) -> bool:
 
 def apply_tier_overrides(user: User) -> User:
     """
-    QA helper: for approved tester emails, *treat as Pro* (non-persistent).
-    Controlled by:
-      - PRO_TEST_ENABLE
-      - PRO_TEST_EMAILS (env) + PRO_TEST_EMAILS_HARDCODE (code)
+    Non-persistent QA overrides (never downgrade higher real tiers).
+    Precedence: premium_tester > pro_plus_tester > pro_tester.
     """
     try:
         if not PRO_TEST_ENABLE:
             return user
         email = (getattr(user, "email", "") or "").lower()
+        current = _user_tier(user)
+
+        # Don't touch real Admin/Premium users
+        if current in ("admin", "premium"):
+            return user
+
+        # 1) Premium tester
+        if email in PREMIUM_TEST_EMAILS:
+            if current != "premium":
+                user.tier = "premium"
+                user.is_paid = True
+            return user
+
+        # 2) Pro+ tester
+        if email in PRO_PLUS_TEST_EMAILS:
+            if current not in ("pro_plus",):
+                user.tier = "pro_plus"
+                user.is_paid = True
+            return user
+
+        # 3) Pro tester
         if email in PRO_TEST_EMAILS or email in PRO_TEST_EMAILS_HARDCODE:
-            # Do NOT write back to DB; keep this an in-memory override.
-            user.tier = "pro"
-            user.is_paid = True
+            if current not in ("pro", "pro_plus"):
+                user.tier = "pro"
+                user.is_paid = True
     except Exception:
         pass
     return user
@@ -291,33 +312,43 @@ async def login(request: Request, db: Session = Depends(get_db)):
     if not email or not password:
         raise HTTPException(status_code=400, detail="Email and password required")
 
+    # --- Tester sets (read from env each call; safe if globals missing) ---
+    pro_test_set      = {e.strip().lower() for e in (os.getenv("PRO_TEST_EMAILS", "")).split(",") if e.strip()}
+    pro_test_set |= {"testpro@123.com"}  # keep hardcoded tester for QA
+    plus_test_set     = {e.strip().lower() for e in (os.getenv("PRO_PLUS_TEST_EMAILS", "")).split(",") if e.strip()}
+    premium_test_set  = {e.strip().lower() for e in (os.getenv("PREMIUM_TEST_EMAILS", "")).split(",") if e.strip()}
+    qa_enabled        = (os.getenv("PRO_TEST_ENABLE", "1").lower() in ("1","true","yes"))
+    auto_create       = (os.getenv("PRO_TEST_AUTO_CREATE", "1").lower() in ("1","true","yes"))
+    default_pw        = os.getenv("PRO_TEST_DEFAULT_PASSWORD", "testpro123")
+
+    is_pro_tester  = qa_enabled and (email in pro_test_set)
+    is_plus_tester = qa_enabled and (email in plus_test_set)
+    is_prem_tester = qa_enabled and (email in premium_test_set)
+
     # 2) Lookup user (or optionally auto-create for approved tester emails)
     user = db.query(User).filter(User.email == email).first()
-    is_tester = PRO_TEST_ENABLE and (email in PRO_TEST_EMAILS or email in PRO_TEST_EMAILS_HARDCODE)
-
     if not user:
-        if is_tester and PRO_TEST_AUTO_CREATE:
-            # Auto-provision a test user with provided password; fallback to default if blank
-            hashed = get_password_hash(password or PRO_TEST_DEFAULT_PASSWORD)
+        if (is_pro_tester or is_plus_tester or is_prem_tester) and auto_create:
+            # Auto-provision a tester with provided password; fallback to default if blank
+            hashed = get_password_hash(password or default_pw)
             user = User(
                 email=email,
                 hashed_password=hashed,
                 is_admin=False,
-                is_paid=False,           # we won't persist paid; override handles Pro behavior
+                is_paid=False,  # behavior/flags below are non-persistent
                 created_at=datetime.utcnow(),
             )
             db.add(user); db.commit(); db.refresh(user)
         else:
             raise HTTPException(status_code=401, detail="User not found")
 
-    # 3) Verify password (normal flow). If tester auto-created with default, allow that too.
+    # 3) Verify password (allow default tester password too)
     if not verify_password(password, user.hashed_password):
-        # If tester and they used the default QA password, let them in.
-        if not (is_tester and PRO_TEST_DEFAULT_PASSWORD and verify_password(PRO_TEST_DEFAULT_PASSWORD, user.hashed_password)):
+        if not ((is_pro_tester or is_plus_tester or is_prem_tester) and default_pw and verify_password(default_pw, user.hashed_password)):
             raise HTTPException(status_code=401, detail="Incorrect email or password")
 
     # 4) Keep flags loosely in sync with env (do not unset existing is_paid)
-    is_admin_now = email in ADMIN_EMAILS
+    is_admin_now   = email in ADMIN_EMAILS
     is_premium_now = email in PREMIUM_EMAILS
     changed = False
     if hasattr(user, "is_admin") and bool(user.is_admin) != is_admin_now:
@@ -327,8 +358,21 @@ async def login(request: Request, db: Session = Depends(get_db)):
     if changed:
         db.commit()
 
-    # 5) Apply *non-persistent* Pro override for QA testers
-    user = apply_tier_overrides(user)  # <— key line
+    # 5) Non-persistent tester tier overrides (precedence: Premium > Pro+ > Pro; never downgrade Admin/Premium)
+    current_tier = _user_tier(user)
+    if current_tier not in ("admin", "premium"):
+        if is_prem_tester:
+            if current_tier != "premium":
+                user.tier = "premium"; user.is_paid = True
+        elif is_plus_tester:
+            if current_tier not in ("pro_plus",):
+                user.tier = "pro_plus"; user.is_paid = True
+        elif is_pro_tester:
+            if current_tier not in ("pro", "pro_plus"):
+                user.tier = "pro"; user.is_paid = True
+
+    # (Optionally also run central override in case you extended it elsewhere)
+    user = apply_tier_overrides(user)
 
     # 6) Return token shape your frontend expects
     token = create_access_token(email)
@@ -361,9 +405,13 @@ async def signup(request: Request, db: Session = Depends(get_db)):
         if not email or not password:
             raise HTTPException(status_code=422, detail="email and password are required")
 
-        # Basic format check
-        if "@" not in email or "." not in email.split("@")[-1]:
+        # Basic format check — allow relaxed validation in QA
+        relax_validation = (os.getenv("RELAX_EMAIL_VALIDATION", "1" if DEBUG else "0").lower() in ("1","true","yes"))
+        if "@" not in email:
             raise HTTPException(status_code=422, detail="invalid email format")
+        if not relax_validation:
+            if "." not in email.split("@")[-1]:
+                raise HTTPException(status_code=422, detail="invalid email format")
 
         # Hash the password with your existing util
         hashed = get_password_hash(password)
@@ -384,7 +432,12 @@ async def signup(request: Request, db: Session = Depends(get_db)):
         # ✅ Issue token like /api/login (string subject, not dict)
         access_token = create_access_token(user.email)
 
-        return {"ok": True, "user": {"id": user.id, "email": user.email}, "access_token": access_token, "token_type": "bearer"}
+        return {
+            "ok": True,
+            "user": {"id": user.id, "email": user.email},
+            "access_token": access_token,
+            "token_type": "bearer"
+        }
 
     except IntegrityError:
         db.rollback()
