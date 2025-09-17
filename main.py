@@ -625,11 +625,33 @@ async def analyze(
     return {"status":"ok","title":"Analysis Result","summary":"\n\n".join(sections)}
 
 # ---------------- Chat endpoints ----------------
-def _compose_premium_system_prompt() -> str:
-    return (
+
+def _compose_premium_system_prompt(tier: str) -> str:
+    base = (
         "You are CAIO — a pragmatic business & ops copilot. "
         "Answer clearly in Markdown. When files are provided, ground your answer on them."
     )
+
+    # For Premium / Pro+ (and Admin), force the 5-CXO structure every time
+    if tier in ("premium", "pro_plus", "admin"):
+        return base + "\n\n" + (
+            "STRUCTURE YOUR ENTIRE REPLY EXACTLY AS FOLLOWS (strict Markdown):\n"
+            "For each role in this order — CFO, CHRO, COO, CMO, CPO — produce:\n"
+            "## <ROLE>\n"
+            "### Insights\n"
+            "1. <insight>\n"
+            "2. <insight>\n"
+            "3. <insight>\n\n"
+            "### Recommendations\n"
+            "1. **<headline>**: <ONE sentence action.>\n"
+            "2. **<headline>**: <ONE sentence action.>\n"
+            "3. **<headline>**: <ONE sentence action.>\n\n"
+            "Rules:\n"
+            "- Use only these five sections, in this order. No preamble/epilogue.\n"
+            "- If context is insufficient for a bullet, write: 'No material evidence in the provided context.'\n"
+            "- Be concrete and business-grade. Keep recommendation bullets to one sentence each."
+        )
+    return base
 
 def _ensure_session(db: Session, user_id: int, session_id: Optional[int], title_hint: Optional[str]) -> ChatSession:
     if session_id:
@@ -702,7 +724,7 @@ async def chat_send(
     context_block = "\n\n".join(doc_chunks).strip()
 
     # Build LLM messages
-    msgs: List[dict] = [{"role":"system","content": _compose_premium_system_prompt()}]
+    msgs: List[dict] = [{"role":"system","content": _compose_premium_system_prompt(tier)}]
     for m in _history(db, sess.id, uid, limit=40):
         msgs.append({"role": m.role, "content": m.content})
     if context_block:
