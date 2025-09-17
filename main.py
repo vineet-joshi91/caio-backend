@@ -341,6 +341,7 @@ async def signup(request: Request, db: Session = Depends(get_db)):
     Create a new user account.
     Accepts either JSON (application/json) or form-data (multipart/x-www-form-urlencoded).
     Only uses columns that actually exist in db.py::User.
+    Returns the SAME token shape as /api/login.
     """
     try:
         email = ""
@@ -380,8 +381,8 @@ async def signup(request: Request, db: Session = Depends(get_db)):
         db.commit()
         db.refresh(user)
 
-        # Issue token on signup (consistent with login)
-        access_token = create_access_token({"sub": user.email})
+        # ✅ Issue token like /api/login (string subject, not dict)
+        access_token = create_access_token(user.email)
 
         return {"ok": True, "user": {"id": user.id, "email": user.email}, "access_token": access_token, "token_type": "bearer"}
 
