@@ -204,6 +204,21 @@ def _analyze_limit_for_tier(tier: str) -> Optional[int]:
     # demo / fallback
     return DEMO_ANALYZE_PER_DAY
 
+def _chat_limits_for_tier(tier: str) -> Tuple[Optional[int], Optional[int]]:
+    """
+    Returns (msgs_per_day, uploads_per_day). None means unlimited.
+    """
+    if tier in ("admin", "premium"):
+        return (None, None)
+    if tier == "pro_plus":
+        msgs = int(os.getenv("PRO_PLUS_MSGS_PER_DAY", "25") or "25")
+        up   = int(os.getenv("UPLOADS_PER_DAY_PAID", "50") or "50")
+        return (msgs, up)
+    # Demo/Pro (trial chat)
+    msgs = int(os.getenv("FREE_CHAT_MSGS_PER_DAY", "3") or "3")
+    up   = int(os.getenv("FREE_CHAT_UPLOADS_PER_DAY", "3") or "3")
+    return (msgs, up)
+    
 # ---------- usage helpers ----------
 def _today_bounds_utc() -> Tuple[datetime, datetime]:
     now = datetime.utcnow()
@@ -631,12 +646,11 @@ def _compose_premium_system_prompt(tier: str) -> str:
         "You are CAIO — a pragmatic business & ops copilot. "
         "Answer clearly in Markdown. When files are provided, ground your answer on them."
     )
-
-    # For Premium / Pro+ (and Admin), force the 5-CXO structure every time
+    # Premium / Pro+ / Admin: strict 5-CXO layout with 5 recs per role
     if tier in ("premium", "pro_plus", "admin"):
         return base + "\n\n" + (
-            "STRUCTURE YOUR ENTIRE REPLY EXACTLY AS FOLLOWS (strict Markdown):\n"
-            "For each role in this order — CFO, CHRO, COO, CMO, CPO — produce:\n"
+            "STRUCTURE YOUR ENTIRE REPLY **ONLY** AS FOLLOWS (strict Markdown):\n"
+            "For each role in this exact order — CFO, CHRO, COO, CMO, CPO — produce:\n"
             "## <ROLE>\n"
             "### Insights\n"
             "1. <insight>\n"
@@ -645,11 +659,12 @@ def _compose_premium_system_prompt(tier: str) -> str:
             "### Recommendations\n"
             "1. **<headline>**: <ONE sentence action.>\n"
             "2. **<headline>**: <ONE sentence action.>\n"
-            "3. **<headline>**: <ONE sentence action.>\n\n"
-            "Rules:\n"
-            "- Use only these five sections, in this order. No preamble/epilogue.\n"
-            "- If context is insufficient for a bullet, write: 'No material evidence in the provided context.'\n"
-            "- Be concrete and business-grade. Keep recommendation bullets to one sentence each."
+            "3. **<headline>**: <ONE sentence action.>\n"
+            "4. **<headline>**: <ONE sentence action.>\n"
+            "5. **<headline>**: <ONE sentence action.>\n\n"
+            "Ground every point in the provided materials where possible. "
+            "If context is insufficient for a bullet, write: 'No material evidence in the provided context.' "
+            "Do not add any intro or outro text outside these five sections."
         )
     return base
 
@@ -686,54 +701,59 @@ async def chat_send(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    current_user = apply_tier_overrides(current_user)
     tier = _user_tier(current_user)
     uid = getattr(current_user, "id", 0) or 0
 
-    # Free preview caps for Demo/Pro; unlimited for Premium/Admin/Pro+
-    if tier not in ("admin", "premium", "pro_plus"):
-        # count message send cap
+    # --- Per-tier chat & upload limits (now includes Pro+) ---
+    msgs_limit, uploads_limit = _chat_limits_for_tier(tier)
+
+    if msgs_limit is not None:
         used = _count_usage(db, uid, "chat")
-        if used >= FREE_CHAT_MSGS_PER_DAY:
+        if used >= msgs_limit:
             _, end = _today_bounds_utc()
-            return _limit_response(used, FREE_CHAT_MSGS_PER_DAY, end.isoformat()+"Z", tier)
+            return _limit_response(used, msgs_limit, end.isoformat() + "Z", tier)
         _log_usage(db, uid, "chat", "ok")
 
-        # uploads cap (per day)
-        if files:
-            upload_used = _count_usage(db, uid, "chat_upload")
-            if upload_used + len(files) > FREE_CHAT_UPLOADS_PER_DAY:
-                _, end = _today_bounds_utc()
-                return _limit_response(upload_used, FREE_CHAT_UPLOADS_PER_DAY, end.isoformat()+"Z", f"{tier} uploads")
-            for _ in range(len(files)):
-                _log_usage(db, uid, "chat_upload", "ok")
+    if uploads_limit is not None and files:
+        upload_used = _count_usage(db, uid, "chat_upload")
+        if upload_used + len(files) > uploads_limit:
+            _, end = _today_bounds_utc()
+            return _limit_response(upload_used, uploads_limit, end.isoformat() + "Z", f"{tier} uploads")
+        for _ in range(len(files)):
+            _log_usage(db, uid, "chat_upload", "ok")
 
     # Create/reuse session
     sess = _ensure_session(db, uid, session_id, title_hint=(message or "New chat"))
 
-    # Gather short context from all files
+    # Gather short context from all files (simple extractor here; your analyzer has better if you wire it in)
     doc_chunks: List[str] = []
     if files:
         for f in files:
             try:
                 txt = (await _extract_text(f)).strip()
                 if txt:
+                    # spend budget across files
                     doc_chunks.append(txt[:8000])
             except Exception as e:
                 logger.warning("file read failed: %s", e)
     context_block = "\n\n".join(doc_chunks).strip()
 
     # Build LLM messages
-    msgs: List[dict] = [{"role":"system","content": _compose_premium_system_prompt(tier)}]
+    msgs: List[dict] = [{"role": "system", "content": _compose_premium_system_prompt(tier)}]
+
+    # (optional) prior history for continuity
     for m in _history(db, sess.id, uid, limit=40):
         msgs.append({"role": m.role, "content": m.content})
+
+    # Hard-ground the model on document text
     if context_block:
-        msgs.append({"role":"system","content": f"[DOCUMENT EXCERPTS]\n{context_block}"})
+        msgs.append({"role": "system", "content": f"[DOCUMENT TEXT]\n{context_block}"})
+
     if message.strip():
-        msgs.append({"role":"user","content": message.strip()})
+        msgs.append({"role": "user", "content": message.strip()})
         _save_msg(db, sess.id, "user", message.strip())
 
-    # Model call (OpenRouter only)
+    # Model call
     reply = _call_openrouter(msgs)
     _save_msg(db, sess.id, "assistant", reply)
 
