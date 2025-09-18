@@ -561,7 +561,7 @@ async def _admin_users_search_impl(
         "items": items,
     }
 
-@app.get("/api/admin/users/summary")
+@app.api_route("/api/admin/users/summary", methods=["GET", "POST"])
 def admin_users_summary(db: Session = Depends(get_db), current: User = Depends(get_current_user)):
     _require_admin(current)
 
@@ -618,6 +618,6 @@ async def admin_users_alias(
 # (Chat/Admin routers) — only mounted if present in the repo
 # --------------------------------------------------------------------------------------
 if chat_router:
-    app.include_router(chat_router, prefix="/api/chat", tags=["chat"])
+    app.include_router(chat_router)
 if admin_router:
-    app.include_router(admin_router, prefix="/api/admin", tags=["admin"])
+    app.include_router(admin_router)
