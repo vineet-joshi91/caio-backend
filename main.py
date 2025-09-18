@@ -208,69 +208,24 @@ def apply_tier_overrides(user: User) -> User:
 # --------------------------------------------------------------------------------------
 # Auth
 # --------------------------------------------------------------------------------------
+from datetime import timedelta
+
 @app.post("/api/login")
-async def login(request: Request, db: Session = Depends(get_db)):
-    email = ""
-    password = ""
-    ctype = (request.headers.get("content-type") or "").lower()
-    try:
-        if ctype.startswith("application/json"):
-            data = await request.json()
-            email = (data.get("email") or data.get("username") or "").strip().lower()
-            password = data.get("password") or ""
-        else:
-            form = await request.form()
-            email = (form.get("email") or form.get("username") or "").strip().lower()
-            password = form.get("password") or ""
-    except Exception:
-        try:
-            data = await request.json()
-            email = (data.get("username") or data.get("email") or "").strip().lower()
-            password = data.get("password") or ""
-        except Exception:
-            pass
-
-    if not email or not password:
-        raise HTTPException(status_code=400, detail="Email and password required")
-
-    user = db.query(User).filter(User.email == email).first()
-    is_tester = PRO_TEST_ENABLE and (email in PRO_TEST_EMAILS or email in PRO_TEST_EMAILS_HARDCODE)
-
+def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+    """
+    OAuth2PasswordRequestForm uses 'username' for email by spec.
+    Issues a JWT whose payload is { sub: <email>, exp: ... } so that auth.py can decode it.
+    """
+    user = authenticate_user(db, form_data.username, form_data.password)
     if not user:
-        if is_tester and PRO_TEST_AUTO_CREATE:
-            hashed = get_password_hash(password or PRO_TEST_DEFAULT_PW)
-            user = User(
-                email=email,
-                hashed_password=hashed,
-                is_admin=False,
-                is_paid=False,
-                created_at=datetime.utcnow(),
-            )
-            db.add(user); db.commit(); db.refresh(user)
-        else:
-            raise HTTPException(status_code=401, detail="User not found")
+        raise HTTPException(status_code=401, detail="Invalid email or password")
 
-    if not verify_password(password, user.hashed_password):
-        if not (is_tester and PRO_TEST_DEFAULT_PW and verify_password(PRO_TEST_DEFAULT_PW, user.hashed_password)):
-            raise HTTPException(status_code=401, detail="Incorrect email or password")
-
-    changed = False
-    if hasattr(user, "is_admin"):
-        admin_now = email in ADMIN_EMAILS
-        if bool(user.is_admin) != admin_now:
-            user.is_admin = admin_now
-            changed = True
-    if hasattr(user, "is_paid"):
-        premium_now = email in PREMIUM_EMAILS
-        if premium_now and not bool(user.is_paid):
-            user.is_paid = True
-            changed = True
-    if changed:
-        db.commit()
-
-    user = apply_tier_overrides(user)
-    token = create_access_token(email)
-    return {"access_token": token, "token_type": "bearer"}
+    # IMPORTANT: create token with sub=email (NOT a dict of fields)
+    access_token = create_access_token(
+        sub=user.email,
+        expires_delta=timedelta(days=1),
+    )
+    return {"access_token": access_token, "token_type": "bearer"}
 
 @app.post("/api/signup")
 async def signup(request: Request, db: Session = Depends(get_db)):
