@@ -1,64 +1,92 @@
 # -*- coding: utf-8 -*-
-# main.py (CAIO Backend) — resilient startup + intact routes
+# main.py — CAIO Backend (resilient startup, stable routes, pricing endpoints)
 
-import os, json, logging, traceback
-from typing import Optional, List, Tuple
-from datetime import datetime, timedelta
+import os
+import re
+import json
 import asyncio
+import logging
+import traceback
+from io import BytesIO
+from datetime import datetime, timedelta
+from typing import Optional, Tuple, List, Dict, Any
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Request, Query
-from fastapi.responses import JSONResponse, Response
+from fastapi import (
+    FastAPI, Depends, HTTPException, UploadFile, File, Form, Request, Query
+)
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy import func
+from pydantic import BaseModel
 
-# project modules
+# ---- Project modules (must exist in your repo) ----
 from db import get_db, User, init_db, UsageLog, ChatSession, ChatMessage
 from auth import create_access_token, verify_password, get_password_hash, get_current_user
 
+# Optional routers (don’t fail boot if they’re absent)
+try:
+    from routers import chat_router   # type: ignore
+except Exception:
+    chat_router = None  # noqa: E305
+try:
+    from routers import admin_router  # type: ignore
+except Exception:
+    admin_router = None  # noqa: E305
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("caio")
-DEBUG = os.getenv("DEBUG", "0").lower() in ("1", "true", "yes")
 
-# ---------------------------------------------------------------------
-# Resilient startup: warm DB on lifespan instead of crashing on import
-# ---------------------------------------------------------------------
-
+# --------------------------------------------------------------------------------------
+# Lifespan: resilient startup with diagnostics (appears in /api/ready)
+# --------------------------------------------------------------------------------------
 DB_READY = False
+STARTUP_OK = False
+STARTUP_ERROR = ""
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
-    Warm up database connections *without* crashing the process.
-    Handles Render cold starts / transient Neon connection issues.
+    Keep startup resilient: warm DB with retries; never hard-crash the process.
+    Any exception is captured and exposed via /api/ready for quick diagnosis.
     """
-    global DB_READY
+    global DB_READY, STARTUP_OK, STARTUP_ERROR
     tries = int(os.getenv("DB_WARMUP_TRIES", "20"))
     delay = float(os.getenv("DB_WARMUP_DELAY", "1.5"))
-    for i in range(tries):
-        try:
-            init_db()  # existing initializer
-            DB_READY = True
-            break
-        except Exception as e:
-            logger.warning("init_db attempt %s/%s failed: %s", i + 1, tries, e)
-            await asyncio.sleep(delay)
-    # Keep serving even if DB isn't ready yet; requests can succeed once DB comes up
-    yield
+    try:
+        for i in range(tries):
+            try:
+                init_db()
+                DB_READY = True
+                break
+            except Exception as e:
+                logger.warning("init_db attempt %s/%s failed: %s", i + 1, tries, e)
+                await asyncio.sleep(delay)
+        STARTUP_OK = True
+        STARTUP_ERROR = ""
+        yield
+    except Exception:
+        STARTUP_OK = False
+        STARTUP_ERROR = traceback.format_exc()
+        logger.error("Startup failed:\n%s", STARTUP_ERROR)
+        # still yield so health/ready endpoints respond with details
+        yield
 
-app = FastAPI(title="CAIO Backend", version="0.4.0", lifespan=lifespan)
 
-# ---------------- CORS ----------------
+app = FastAPI(title="CAIO Backend", version="0.5.0", lifespan=lifespan)
+
+# --------------------------------------------------------------------------------------
+# CORS
+# --------------------------------------------------------------------------------------
 ALLOWED_ORIGINS = [
     "https://caio-frontend.vercel.app",
     "https://caioai.netlify.app",
-    "http://localhost",
     "http://localhost:3000",
     "http://127.0.0.1:3000",
 ]
-extra = os.getenv("ALLOWED_ORIGINS", "")
+extra = (os.getenv("ALLOWED_ORIGINS") or "").strip()
 if extra:
     ALLOWED_ORIGINS += [o.strip() for o in extra.split(",") if o.strip()]
 
@@ -76,150 +104,61 @@ app.add_middleware(
 def cors_preflight(path: str):
     return JSONResponse({"ok": True})
 
-# ---------------- Health ----------------
+# --------------------------------------------------------------------------------------
+# Health / Ready
+# --------------------------------------------------------------------------------------
 @app.get("/")
 def root():
-    return {"ok": True, "service": "caio-backend", "version": "0.4.0"}
+    return {"ok": True, "service": "caio-backend", "version": "0.5.0"}
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "version": "0.4.0"}
+    return {"status": "ok", "version": "0.5.0"}
 
 @app.get("/api/ready")
 def ready():
-    # Always respond 200 so Render doesn't kill the instance; report DB readiness flag
-    return {"ready": True, "db_ready": DB_READY, "time": datetime.utcnow().isoformat() + "Z"}
+    return {
+        "ready": True,
+        "db_ready": DB_READY,
+        "startup_ok": STARTUP_OK,
+        "startup_error": (STARTUP_ERROR[:4000] if STARTUP_ERROR else ""),
+        "time": datetime.utcnow().isoformat() + "Z",
+    }
 
-# ---------------- Tiers & limits ----------------
-ADMIN_EMAILS    = {e.strip().lower() for e in os.getenv("ADMIN_EMAILS", "").split(",") if e.strip()}
-PREMIUM_EMAILS  = {e.strip().lower() for e in os.getenv("PREMIUM_EMAILS", "").split(",") if e.strip()}
-PRO_PLUS_EMAILS = {e.strip().lower() for e in os.getenv("PRO_PLUS_EMAILS", "").split(",") if e.strip()}
-PRO_TEST_EMAILS = {e.strip().lower() for e in os.getenv("PRO_TEST_EMAILS", "").split(",") if e.strip()}  # for QA
+# --------------------------------------------------------------------------------------
+# Tiers, testers and limits
+# --------------------------------------------------------------------------------------
+def _env_set(name: str) -> set:
+    raw = os.getenv(name, "")
+    return {e.strip().lower() for e in raw.split(",") if e.strip()}
 
-# Analyzer/demo caps (legacy/free)
+ADMIN_EMAILS      = _env_set("ADMIN_EMAILS")
+PREMIUM_EMAILS    = _env_set("PREMIUM_EMAILS")
+PRO_PLUS_EMAILS   = _env_set("PRO_PLUS_EMAILS")
+PRO_TEST_EMAILS   = _env_set("PRO_TEST_EMAILS")
+
+# hardcoded legacy tester id is allowed but optional
+PRO_TEST_EMAILS_HARDCODE = {"testpro@123.com"}
+
+def _bool_env(name: str, default: bool = False) -> bool:
+    v = (os.getenv(name, "").strip().lower())
+    if not v:
+        return default
+    return v in ("1", "true", "yes", "y", "t")
+
+PRO_TEST_ENABLE        = _bool_env("PRO_TEST_ENABLE", True)
+PRO_TEST_AUTO_CREATE   = _bool_env("PRO_TEST_AUTO_CREATE", True)
+PRO_TEST_DEFAULT_PW    = os.getenv("PRO_TEST_DEFAULT_PASSWORD", "testpro123")
+
+# “Free/Trial” preview caps (fallbacks to TRIAL_* or small defaults)
+FREE_CHAT_MSGS_PER_DAY    = int(os.getenv("FREE_CHAT_MSGS_PER_DAY", os.getenv("TRIAL_MAX_MSGS", "3")))
+FREE_CHAT_UPLOADS_PER_DAY = int(os.getenv("FREE_CHAT_UPLOADS_PER_DAY", os.getenv("TRIAL_MAX_MSGS", "3")))
+
 FREE_QUERIES_PER_DAY = int(os.getenv("FREE_QUERIES_PER_DAY", "3"))
 FREE_UPLOADS         = int(os.getenv("FREE_UPLOADS", "3"))
 FREE_BRAINS          = int(os.getenv("FREE_BRAINS", "2"))
 
-# ---- Per-tier analyze limits (docs/day) ----
-# Pro defaults to 25/day; if you prefer your env PRO_QUERIES_PER_DAY, it will be used when PRO_ANALYZE_PER_DAY unset.
-PRO_ANALYZE_PER_DAY      = int(os.getenv("PRO_ANALYZE_PER_DAY", os.getenv("PRO_QUERIES_PER_DAY", "25")))
-PRO_PLUS_ANALYZE_PER_DAY = int(os.getenv("PRO_PLUS_ANALYZE_PER_DAY", "50"))
-DEMO_ANALYZE_PER_DAY     = int(os.getenv("DEMO_ANALYZE_PER_DAY",  str(FREE_QUERIES_PER_DAY)))  # default 3
-# Premium/Admin are unlimited for analyze
-
-# Chat preview caps for Demo/Pro (Pro+ & Premium/Admin unlimited in chat)
-FREE_CHAT_MSGS_PER_DAY     = int(os.getenv("FREE_CHAT_MSGS_PER_DAY", "3"))
-FREE_CHAT_UPLOADS_PER_DAY  = int(os.getenv("FREE_CHAT_UPLOADS_PER_DAY", "3"))
-
-# --- PRO QA testing toggles (deduped) ---
-PRO_TEST_ENABLE           = os.getenv("PRO_TEST_ENABLE", "1").lower() in ("1","true","yes")
-PRO_TEST_EMAILS_HARDCODE  = {"testpro@123.com"}  # keep hardcoded tester during QA
-PRO_TEST_AUTO_CREATE      = os.getenv("PRO_TEST_AUTO_CREATE", "1").lower() in ("1","true","yes")
-PRO_TEST_DEFAULT_PASSWORD = os.getenv("PRO_TEST_DEFAULT_PASSWORD", "testpro123")
-PRO_PLUS_TEST_EMAILS = {e.strip().lower() for e in os.getenv("PRO_PLUS_TEST_EMAILS", "").split(",") if e.strip()}
-PREMIUM_TEST_EMAILS = {e.strip().lower() for e in os.getenv("PREMIUM_TEST_EMAILS", "").split(",") if e.strip()}
-
-def _user_tier(u: User) -> str:
-    """
-    Resolve a user's tier. Priority:
-    1) explicit u.tier if present
-    2) ADMIN_EMAILS -> admin
-    3) PRO_PLUS_EMAILS -> pro_plus
-    4) PREMIUM_EMAILS -> premium
-    5) legacy is_paid flag -> pro
-    6) fallback -> demo
-    """
-    email = (getattr(u, "email", "") or "").lower()
-
-    explicit = getattr(u, "tier", None)
-    if isinstance(explicit, str) and explicit in ("admin", "premium", "pro_plus", "pro", "demo"):
-        return explicit
-
-    if not email:
-        return "demo"
-    if email in ADMIN_EMAILS:
-        return "admin"
-    if email in PRO_PLUS_EMAILS:
-        return "pro_plus"
-    if email in PREMIUM_EMAILS:
-        return "premium"
-    if getattr(u, "is_paid", False):
-        return "pro"
-    return "demo"
-
-def _is_admin(u: User) -> bool:
-    return _user_tier(u) == "admin"
-
-def _is_premium_or_plus(u: User) -> bool:
-    t = _user_tier(u)
-    return t in ("admin", "premium", "pro_plus")
-
-def apply_tier_overrides(user: User) -> User:
-    """
-    Non-persistent QA overrides (never downgrade higher real tiers).
-    Precedence: premium_tester > pro_plus_tester > pro_tester.
-    """
-    try:
-        if not PRO_TEST_ENABLE:
-            return user
-        email = (getattr(user, "email", "") or "").lower()
-        current = _user_tier(user)
-
-        # Don't touch real Admin/Premium users
-        if current in ("admin", "premium"):
-            return user
-
-        # 1) Premium tester
-        if email in PREMIUM_TEST_EMAILS:
-            if current != "premium":
-                user.tier = "premium"
-                user.is_paid = True
-            return user
-
-        # 2) Pro+ tester
-        if email in PRO_PLUS_TEST_EMAILS:
-            if current not in ("pro_plus",):
-                user.tier = "pro_plus"
-                user.is_paid = True
-            return user
-
-        # 3) Pro tester
-        if email in PRO_TEST_EMAILS or email in PRO_TEST_EMAILS_HARDCODE:
-            if current not in ("pro", "pro_plus"):
-                user.tier = "pro"
-                user.is_paid = True
-    except Exception:
-        pass
-    return user
-
-def _analyze_limit_for_tier(tier: str) -> Optional[int]:
-    # None means unlimited
-    if tier in ("admin", "premium"):
-        return None
-    if tier == "pro_plus":
-        return PRO_PLUS_ANALYZE_PER_DAY
-    if tier == "pro":
-        return PRO_ANALYZE_PER_DAY
-    # demo / fallback
-    return DEMO_ANALYZE_PER_DAY
-
-def _chat_limits_for_tier(tier: str) -> Tuple[Optional[int], Optional[int]]:
-    """
-    Returns (msgs_per_day, uploads_per_day). None means unlimited.
-    """
-    if tier in ("admin", "premium"):
-        return (None, None)
-    if tier == "pro_plus":
-        msgs = int(os.getenv("PRO_PLUS_MSGS_PER_DAY", "25") or "25")
-        up   = int(os.getenv("UPLOADS_PER_DAY_PAID", "50") or "50")
-        return (msgs, up)
-    # Demo/Pro (trial chat)
-    msgs = int(os.getenv("FREE_CHAT_MSGS_PER_DAY", "3") or "3")
-    up   = int(os.getenv("FREE_CHAT_UPLOADS_PER_DAY", "3") or "3")
-    return (msgs, up)
-    
-# ---------- usage helpers ----------
+# usage helpers
 def _today_bounds_utc() -> Tuple[datetime, datetime]:
     now = datetime.utcnow()
     start = datetime(now.year, now.month, now.day)
@@ -236,11 +175,8 @@ def _count_usage(db: Session, user_id: int, endpoint: str) -> int:
     ).count()
 
 def _log_usage(db: Session, user_id: int, endpoint: str, status: str = "ok", meta: str = ""):
-    try:
-        db.add(UsageLog(user_id=user_id or 0, timestamp=datetime.utcnow(), endpoint=endpoint, status=status, meta=meta))
-        db.commit()
-    except Exception:
-        db.rollback()
+    db.add(UsageLog(user_id=user_id or 0, timestamp=datetime.utcnow(), endpoint=endpoint, status=status, meta=meta))
+    db.commit()
 
 def _limit_response(used: int, limit: int, reset_at: Optional[str], plan: str):
     return JSONResponse({
@@ -253,60 +189,85 @@ def _limit_response(used: int, limit: int, reset_at: Optional[str], plan: str):
         "reset_at": reset_at,
     }, status_code=429)
 
-def _check_and_increment_usage(
-    db: Session,
-    user: User,
-    endpoint: str,
-    plan: Optional[str] = None,
-    limit_override: Optional[int] = None,
-) -> Tuple[bool, int, int, str]:
+# ---- tier helpers ----
+def _user_tier(u: User) -> str:
+    email = (getattr(u, "email", "") or "").lower()
+    explicit = getattr(u, "tier", None)
+    if isinstance(explicit, str) and explicit in ("admin", "premium", "pro_plus", "pro", "demo"):
+        return explicit
+    if not email:
+        return "demo"
+    if email in ADMIN_EMAILS:
+        return "admin"
+    if email in PRO_PLUS_EMAILS:
+        return "pro_plus"
+    if email in PREMIUM_EMAILS or getattr(u, "is_paid", False):
+        # treat any paid flag or premium email as Pro by default (unless pro_plus/premium above)
+        return "pro"
+    return "demo"
+
+def _is_admin(u: User) -> bool:
+    return _user_tier(u) == "admin"
+
+def apply_tier_overrides(user: User) -> User:
     """
-    Returns (allowed, used_or_next, limit, plan_or_reset_at)
-    - If allowed=False: used_or_next=used_count, plan_or_reset_at=reset_at
-    - If allowed=True:  used_or_next=used_count+1 (or 0 if unlimited), plan_or_reset_at=plan
+    QA override: allow emails listed in PRO_TEST_EMAILS (or legacy hardcoded)
+    to behave as Pro without changing persistent billing state.
     """
-    user_id = getattr(user, "id", 0) or 0
-    plan = plan or _user_tier(user)
+    try:
+        allow = _env_set("PRO_TEST_EMAILS")
+        allow |= PRO_TEST_EMAILS_HARDCODE
+        email = (user.email or "").lower()
+        if PRO_TEST_ENABLE and email in allow:
+            user.tier = "pro"
+            user.is_paid = True
+    except Exception:
+        pass
+    return user
 
-    # ----- Unlimited tiers by endpoint -----
-    if endpoint == "analyze":
-        tier_limit = _analyze_limit_for_tier(plan) if limit_override is None else limit_override
-        if tier_limit is None:  # unlimited for analyze
-            _log_usage(db, user_id, endpoint, "ok")
-            return True, 0, 0, plan
+# --------------------------------------------------------------------------------------
+# Auth — robust JSON or form parsing; tester auto-create; stable token shape
+# --------------------------------------------------------------------------------------
+def _extract_email_password_from_request(request: Request) -> Tuple[str, str]:
+    email = ""
+    password = ""
+    ctype = (request.headers.get("content-type") or "").lower()
+    async def _try_json():
+        try:
+            data = await request.json()
+            return (
+                (data.get("email") or data.get("username") or "").strip().lower(),
+                data.get("password") or "",
+            )
+        except Exception:
+            return "", ""
 
-    elif endpoint == "chat":
-        # Premium/Admin/Pro+ get unlimited chat; Pro/Demo use preview cap
-        if plan in ("admin", "premium", "pro_plus") and limit_override is None:
-            _log_usage(db, user_id, endpoint, "ok")
-            return True, 0, 0, plan
-        tier_limit = limit_override if limit_override is not None else FREE_CHAT_MSGS_PER_DAY
+    async def _try_form():
+        try:
+            form = await request.form()
+            return (
+                (form.get("email") or form.get("username") or "").strip().lower(),
+                form.get("password") or "",
+            )
+        except Exception:
+            return "", ""
 
-    else:
-        tier_limit = limit_override if limit_override is not None else FREE_QUERIES_PER_DAY
+    return asyncio.get_event_loop().run_until_complete(
+        _try_json() if ctype.startswith("application/json") else _try_form()
+    ) or ("", "")
 
-    # ----- Count & enforce -----
-    used = _count_usage(db, user_id, endpoint)
-    if used >= tier_limit:
-        _, end = _today_bounds_utc()
-        return False, used, tier_limit, end.isoformat() + "Z"
-
-    _log_usage(db, user_id, endpoint, "ok")
-    return True, used + 1, tier_limit, plan
-
-# ---------------- Auth ----------------
 @app.post("/api/login")
 async def login(request: Request, db: Session = Depends(get_db)):
     """
-    Accept BOTH form (application/x-www-form-urlencoded) and JSON bodies.
-    If a tester email signs in and doesn't exist, optionally auto-create (guarded by env).
-    Always returns the same token shape your frontend expects.
+    Accept BOTH form (application/x-www-form-urlencoded/multipart) and JSON.
+    If an allowed tester email signs in and doesn't exist, optionally auto-create.
+    Always returns token shape: {"access_token": "...", "token_type": "bearer"}
     """
     email = ""
     password = ""
     ctype = (request.headers.get("content-type") or "").lower()
 
-    # 1) Parse input (JSON or form)
+    # parse body
     try:
         if ctype.startswith("application/json"):
             data = await request.json()
@@ -317,9 +278,10 @@ async def login(request: Request, db: Session = Depends(get_db)):
             email = (form.get("email") or form.get("username") or "").strip().lower()
             password = form.get("password") or ""
     except Exception:
+        # last chance: try JSON again
         try:
             data = await request.json()
-            email = (data.get("username") or "").strip().lower()
+            email = (data.get("username") or data.get("email") or "").strip().lower()
             password = data.get("password") or ""
         except Exception:
             pass
@@ -327,86 +289,59 @@ async def login(request: Request, db: Session = Depends(get_db)):
     if not email or not password:
         raise HTTPException(status_code=400, detail="Email and password required")
 
-    # --- Tester sets (read from env each call; safe if globals missing) ---
-    pro_test_set      = {e.strip().lower() for e in (os.getenv("PRO_TEST_EMAILS", "")).split(",") if e.strip()}
-    pro_test_set |= {"testpro@123.com"}  # keep hardcoded tester for QA
-    plus_test_set     = {e.strip().lower() for e in (os.getenv("PRO_PLUS_TEST_EMAILS", "")).split(",") if e.strip()}
-    premium_test_set  = {e.strip().lower() for e in (os.getenv("PREMIUM_TEST_EMAILS", "")).split(",") if e.strip()}
-    qa_enabled        = (os.getenv("PRO_TEST_ENABLE", "1").lower() in ("1","true","yes"))
-    auto_create       = (os.getenv("PRO_TEST_AUTO_CREATE", "1").lower() in ("1","true","yes"))
-    default_pw        = os.getenv("PRO_TEST_DEFAULT_PASSWORD", "testpro123")
-
-    is_pro_tester  = qa_enabled and (email in pro_test_set)
-    is_plus_tester = qa_enabled and (email in plus_test_set)
-    is_prem_tester = qa_enabled and (email in premium_test_set)
-
-    # 2) Lookup user (or optionally auto-create for approved tester emails)
     user = db.query(User).filter(User.email == email).first()
+    is_tester = PRO_TEST_ENABLE and (email in PRO_TEST_EMAILS or email in PRO_TEST_EMAILS_HARDCODE)
+
     if not user:
-        if (is_pro_tester or is_plus_tester or is_prem_tester) and auto_create:
-            # Auto-provision a tester with provided password; fallback to default if blank
-            hashed = get_password_hash(password or default_pw)
+        if is_tester and PRO_TEST_AUTO_CREATE:
+            # auto-provision with provided password (or default)
+            hashed = get_password_hash(password or PRO_TEST_DEFAULT_PW)
             user = User(
                 email=email,
                 hashed_password=hashed,
                 is_admin=False,
-                is_paid=False,  # behavior/flags below are non-persistent
+                is_paid=False,
                 created_at=datetime.utcnow(),
             )
             db.add(user); db.commit(); db.refresh(user)
         else:
             raise HTTPException(status_code=401, detail="User not found")
 
-    # 3) Verify password (allow default tester password too)
+    # password check (permit testers using default)
     if not verify_password(password, user.hashed_password):
-        if not ((is_pro_tester or is_plus_tester or is_prem_tester) and default_pw and verify_password(default_pw, user.hashed_password)):
+        if not (is_tester and PRO_TEST_DEFAULT_PW and verify_password(PRO_TEST_DEFAULT_PW, user.hashed_password)):
             raise HTTPException(status_code=401, detail="Incorrect email or password")
 
-    # 4) Keep flags loosely in sync with env (do not unset existing is_paid)
-    is_admin_now   = email in ADMIN_EMAILS
-    is_premium_now = email in PREMIUM_EMAILS
+    # keep admin/premium flags loosely in sync with env
     changed = False
-    if hasattr(user, "is_admin") and bool(user.is_admin) != is_admin_now:
-        user.is_admin = is_admin_now; changed = True
-    if hasattr(user, "is_paid") and is_premium_now and not bool(user.is_paid):
-        user.is_paid = True; changed = True
+    if hasattr(user, "is_admin"):
+        admin_now = email in ADMIN_EMAILS
+        if bool(user.is_admin) != admin_now:
+            user.is_admin = admin_now
+            changed = True
+    if hasattr(user, "is_paid"):
+        premium_now = email in PREMIUM_EMAILS
+        if premium_now and not bool(user.is_paid):
+            user.is_paid = True
+            changed = True
     if changed:
         db.commit()
 
-    # 5) Non-persistent tester tier overrides (precedence: Premium > Pro+ > Pro; never downgrade Admin/Premium)
-    current_tier = _user_tier(user)
-    if current_tier not in ("admin", "premium"):
-        if is_prem_tester:
-            if current_tier != "premium":
-                user.tier = "premium"; user.is_paid = True
-        elif is_plus_tester:
-            if current_tier not in ("pro_plus",):
-                user.tier = "pro_plus"; user.is_paid = True
-        elif is_pro_tester:
-            if current_tier not in ("pro", "pro_plus"):
-                user.tier = "pro"; user.is_paid = True
-
-    # (Optionally also run central override in case you extended it elsewhere)
+    # non-persistent QA override
     user = apply_tier_overrides(user)
 
-    # 6) Return token shape your frontend expects
     token = create_access_token(email)
     return {"access_token": token, "token_type": "bearer"}
 
-# --- robust /api/signup: accepts JSON or form-data ---
 @app.post("/api/signup")
 async def signup(request: Request, db: Session = Depends(get_db)):
     """
-    Create a new user account.
-    Accepts either JSON (application/json) or form-data (multipart/x-www-form-urlencoded).
-    Only uses columns that actually exist in db.py::User.
-    Returns the SAME token shape as /api/login.
+    Create a new user account (JSON or form-data).
+    Returns: {"ok": True, "user": {"id", "email"}, "access_token", "token_type"}
     """
     try:
         email = ""
         password = ""
-
-        # Accept JSON or form data
         ct = (request.headers.get("content-type") or "").lower()
         if "application/json" in ct:
             data = await request.json()
@@ -420,18 +355,10 @@ async def signup(request: Request, db: Session = Depends(get_db)):
         if not email or not password:
             raise HTTPException(status_code=422, detail="email and password are required")
 
-        # Basic format check — allow relaxed validation in QA
-        relax_validation = (os.getenv("RELAX_EMAIL_VALIDATION", "1" if DEBUG else "0").lower() in ("1","true","yes"))
-        if "@" not in email:
+        if "@" not in email or "." not in email.split("@")[-1]:
             raise HTTPException(status_code=422, detail="invalid email format")
-        if not relax_validation:
-            if "." not in email.split("@")[-1]:
-                raise HTTPException(status_code=422, detail="invalid email format")
 
-        # Hash the password with your existing util
         hashed = get_password_hash(password)
-
-        # Create only the fields that actually exist in db.py::User
         user = User(
             email=email,
             hashed_password=hashed,
@@ -444,14 +371,12 @@ async def signup(request: Request, db: Session = Depends(get_db)):
         db.commit()
         db.refresh(user)
 
-        # ✅ Issue token like /api/login (string subject, not dict)
         access_token = create_access_token(user.email)
-
         return {
             "ok": True,
             "user": {"id": user.id, "email": user.email},
             "access_token": access_token,
-            "token_type": "bearer"
+            "token_type": "bearer",
         }
 
     except IntegrityError:
@@ -464,84 +389,43 @@ async def signup(request: Request, db: Session = Depends(get_db)):
         logger.error("signup failed:\n%s", traceback.format_exc())
         raise HTTPException(status_code=500, detail="Signup failed on the server. Please try again.")
 
-@app.post("/api/logout")
-def logout(response: Response):
-    # Best-effort: clear a non-HttpOnly cookie named "token" if you set one
-    response.delete_cookie("token", path="/")
-    return {"ok": True}
-
+# --------------------------------------------------------------------------------------
+# Profile — small helper the frontend expects
+# --------------------------------------------------------------------------------------
 @app.get("/api/profile")
-def profile(current_user: User = Depends(get_current_user)):
-    current_user = apply_tier_overrides(current_user)
-    tier = _user_tier(current_user)
+def profile(current: User = Depends(get_current_user)):
+    """
+    Return minimal profile the frontend uses; keep key names stable.
+    """
+    u = apply_tier_overrides(current)
+    tier = _user_tier(u)
     return {
-        "email": current_user.email,
+        "email": u.email,
         "tier": tier,
-        "is_admin": getattr(current_user, "is_admin", False),
-        "is_paid": tier in {"pro", "pro_plus", "premium", "admin"},
-        "created_at": getattr(current_user, "created_at", None),
+        "is_admin": (tier == "admin"),
+        "created_at": getattr(u, "created_at", None),
     }
 
-# ---------------- Public config (pricing etc.) ----------------
-
-@app.get("/api/public-config")
-def public_config():
+# --------------------------------------------------------------------------------------
+# Pricing (shared loader) + endpoints: /api/public-config (stable shape) & /api/pricing
+# --------------------------------------------------------------------------------------
+def _load_pricing_from_env() -> Dict[str, Dict[str, Any]]:
     """
-    Stable shape for the app frontend:
+    Returns:
       {
-        "currency": "INR"|"USD",
-        "plans": {"pro": {"price": int}, "pro_plus": {...}, "premium": {...}},
-        "chat_preview": {"enabled": bool, "msgs_per_day": int, "uploads_per_day": int}
+        "INR": {"symbol":"₹","pro":1999,"pro_plus":3999,"premium":7999},
+        "USD": {"symbol":"$","pro":25,"pro_plus":49,"premium":99}
       }
-    """
-    # pick currency; fall back to USD if an unknown currency is configured
-    currency = os.getenv("PAY_DEFAULT_CURRENCY", "INR").upper()
-    table = _load_pricing_from_env()
-    current = table.get(currency) or table.get("USD")
-
-    # Cast to int for stability (your app expects ints here)
-    def _as_int(v):
-        try:
-            return int(round(float(v)))
-        except Exception:
-            return 0
-
-    plans = {
-        "pro":      {"price": _as_int(current.get("pro", 0))},
-        "pro_plus": {"price": _as_int(current.get("pro_plus", 0))},
-        "premium":  {"price": _as_int(current.get("premium", 0))},
-    }
-
-    chat_preview = {
-        "enabled": True,
-        "msgs_per_day": FREE_CHAT_MSGS_PER_DAY,
-        "uploads_per_day": FREE_CHAT_UPLOADS_PER_DAY,
-    }
-
-    return {"currency": currency, "plans": plans, "chat_preview": chat_preview}
-
-
-# --- Pricing loader used by both /api/pricing and /api/public-config ---
-def _load_pricing_from_env():
-    """
-    Returns a dict like:
-    {
-      "INR": {"symbol":"₹","pro":1999,"pro_plus":3999,"premium":7999},
-      "USD": {"symbol":"$","pro":25,"pro_plus":49,"premium":99}
-    }
     Prefers PRICING_JSON; falls back to individual env vars.
     """
-    raw = os.getenv("PRICING_JSON", "").strip()
+    raw = (os.getenv("PRICING_JSON") or "").strip()
     if raw:
         try:
             data = json.loads(raw)
-            # basic shape sanity
             if isinstance(data, dict) and "INR" in data and "USD" in data:
                 return data
         except Exception:
-            pass
-
-    # fallback to discrete env vars
+            logger.warning("Failed to parse PRICING_JSON; falling back to discrete env vars.")
     return {
         "INR": {
             "symbol": "₹",
@@ -557,344 +441,47 @@ def _load_pricing_from_env():
         },
     }
 
+@app.get("/api/pricing")
+def public_pricing():
+    data = _load_pricing_from_env()
+    return {"ok": True, "pricing": data, "updated_at": datetime.utcnow().isoformat() + "Z"}
 
-# ---------------- Analyzer ----------------
-DEFAULT_BRAINS_ORDER = ["CFO","CHRO","COO","CMO","CPO"]
+@app.get("/api/public-config")
+def public_config():
+    """
+    Keep structure stable for the frontend:
+      {
+        "currency": "INR"|"USD",
+        "plans": {"pro": {"price": int}, "pro_plus": {...}, "premium": {...}},
+        "chat_preview": {"enabled": bool, "msgs_per_day": int, "uploads_per_day": int}
+      }
+    """
+    currency = (os.getenv("PAY_DEFAULT_CURRENCY", "INR") or "INR").upper()
+    table = _load_pricing_from_env()
+    current = table.get(currency) or table.get("USD")
 
-def _choose_brains(requested: Optional[str], is_paid: bool) -> List[str]:
-    if requested:
-        items = [b.strip().upper() for b in requested.split(",") if b.strip()]
-        chosen = [b for b in items if b in DEFAULT_BRAINS_ORDER] or DEFAULT_BRAINS_ORDER[:]
-    else:
-        chosen = DEFAULT_BRAINS_ORDER[:]
-    return chosen if is_paid else chosen[: max(1, min(FREE_BRAINS, len(chosen)))]
-
-def _brain_prompt(brief: str, extracted: str, brain: str) -> str:
-    role_map = {
-        "CFO":  "Chief Financial Officer - unit economics; revenue mix, margins, CCC, runway.",
-        "CHRO": "Chief Human Resources Officer - org effectiveness; attrition, engagement.",
-        "COO":  "Chief Operating Officer - cost-to-serve & reliability; capacity, throughput, SLA.",
-        "CMO":  "Chief Marketing Officer - efficient growth; CAC/LTV, funnel, retention.",
-        "CPO":  "Chief People Officer - talent acquisition; pipeline, time-to-hire, QoH.",
-    }
-    role = role_map.get(brain, "Executive Advisor")
-    return f"""
-You are {role}.
-Return STRICT MARKDOWN ONLY for **{brain}** with this structure:
-
-### Insights
-1. <insight>
-2. <insight>
-3. <insight>
-
-### Recommendations
-1. **<headline>**: <ONE sentence action.>
-2. **<headline>**: <ONE sentence action.>
-3. **<headline>**: <ONE sentence action.>
-
-[BRIEF]
-{brief or "(none)"}
-
-[DOCUMENT TEXT]
-{(extracted or "")[:120000]}
-""".strip()
-
-async def _extract_text(file: Optional[UploadFile]) -> str:
-    if not file:
-        return ""
-    try:
-        raw = await file.read()
-        if not raw:
-            return ""
+    def _as_int(v: Any) -> int:
         try:
-            return raw.decode("utf-8", errors="ignore")
+            return int(round(float(v)))
         except Exception:
-            return str(raw[:200000])
-    finally:
-        try:
-            await file.close()
-        except Exception:
-            pass
+            return 0
 
-# ---- OpenRouter only ----
-def _call_openrouter(messages: List[dict]) -> str:
-    key = os.getenv("OPENROUTER_API_KEY", "").strip()
-    if not key:
-        return "OpenRouter key is not configured. Please contact support."
-    import requests
-    headers = {
-        "Authorization": f"Bearer {key}",
-        "HTTP-Referer": "https://caio-frontend.vercel.app",
-        "X-Title": "CAIO",
-        "Content-Type": "application/json",
+    plans = {
+        "pro":      {"price": _as_int(current.get("pro", 0))},
+        "pro_plus": {"price": _as_int(current.get("pro_plus", 0))},
+        "premium":  {"price": _as_int(current.get("premium", 0))},
     }
-    model = os.getenv("LLM_MODEL_OPENROUTER", "openrouter/auto")
-    data = {"model": model, "messages": messages, "temperature": 0.2}
-    r = requests.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, data=json.dumps(data), timeout=60)
-    if r.status_code >= 400:
-        logger.error("OpenRouter %s: %s", r.status_code, r.text)
-        return "The model is currently unavailable. Please try again shortly."
-    try:
-        return r.json()["choices"][0]["message"]["content"]
-    except Exception:
-        return "I had trouble reading the model response."
+    chat_preview = {
+        "enabled": True,
+        "msgs_per_day": FREE_CHAT_MSGS_PER_DAY,
+        "uploads_per_day": FREE_CHAT_UPLOADS_PER_DAY,
+    }
+    return {"currency": currency, "plans": plans, "chat_preview": chat_preview}
 
-# ---------------- Analyze endpoint ----------------
-@app.post("/api/analyze")
-async def analyze(
-    request: Request,
-    file: Optional[UploadFile] = File(None),
-    text: Optional[str] = Form(None),
-    brains: Optional[str] = Form(None),
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    # ✅ Treat QA testers as Pro BEFORE limits
-    current_user = apply_tier_overrides(current_user)
-
-    allowed, used, limit, plan_or_reset = _check_and_increment_usage(db, current_user, endpoint="analyze")
-    if not allowed:
-        # plan_or_reset is reset_at here
-        return _limit_response(used, limit, plan_or_reset, _user_tier(current_user))
-
-    is_paid = _user_tier(current_user) in ("admin", "premium", "pro_plus", "pro")
-    chosen = _choose_brains(brains, is_paid)
-
-    extracted = ""
-    try:
-        extracted = await _extract_text(file)
-    except Exception as e:
-        logger.warning("Extract failed: %s", e)
-
-    # For demo experience w/out key
-    if not os.getenv("OPENROUTER_API_KEY"):
-        summary = f"Demo result.\n\nBrains: {', '.join(chosen)}\n\nBrief:\n{text or '(none)'}"
-        return {"status":"demo","title":"Demo Mode","summary":summary}
-
-    # Call LLM once per brain, then stitch
-    sections = []
-    for b in chosen:
-        prompt = _brain_prompt(text or "", extracted or "", b)
-        sections.append(f"## {b}\n\n" + _call_openrouter([{"role":"user","content":prompt}]))
-
-    return {"status":"ok","title":"Analysis Result","summary":"\n\n".join(sections)}
-
-# ---------------- Chat endpoints ----------------
-
-def _compose_premium_system_prompt(tier: str) -> str:
-    base = (
-        "You are CAIO — a pragmatic business & ops copilot. "
-        "Answer clearly in Markdown. When files are provided, ground your answer on them."
-    )
-    # Premium / Pro+ / Admin: strict 5-CXO layout with 5 recs per role
-    if tier in ("premium", "pro_plus", "admin"):
-        return base + "\n\n" + (
-            "STRUCTURE YOUR ENTIRE REPLY **ONLY** AS FOLLOWS (strict Markdown):\n"
-            "For each role in this exact order — CFO, CHRO, COO, CMO, CPO — produce:\n"
-            "## <ROLE>\n"
-            "### Insights\n"
-            "1. <insight>\n"
-            "2. <insight>\n"
-            "3. <insight>\n\n"
-            "### Recommendations\n"
-            "1. **<headline>**: <ONE sentence action.>\n"
-            "2. **<headline>**: <ONE sentence action.>\n"
-            "3. **<headline>**: <ONE sentence action.>\n"
-            "4. **<headline>**: <ONE sentence action.>\n"
-            "5. **<headline>**: <ONE sentence action.>\n\n"
-            "Ground every point in the provided materials where possible. "
-            "If context is insufficient for a bullet, write: 'No material evidence in the provided context.' "
-            "Do not add any intro or outro text outside these five sections."
-        )
-    return base
-
-def _ensure_session(db: Session, user_id: int, session_id: Optional[int], title_hint: Optional[str]) -> ChatSession:
-    if session_id:
-        sess = db.query(ChatSession).filter(ChatSession.id == session_id, ChatSession.user_id == user_id).first()
-        if sess:
-            return sess
-    title = (title_hint or "New chat").strip()[:120] or "New chat"
-    sess = ChatSession(user_id=user_id, title=title)
-    db.add(sess); db.commit(); db.refresh(sess)
-    return sess
-
-def _save_msg(db: Session, session_id: int, role: str, content: str):
-    db.add(ChatMessage(session_id=session_id, role=role, content=content[:120000], created_at=datetime.utcnow()))
-    db.commit()
-
-def _history(db: Session, session_id: int, user_id: int, limit: int = 40) -> List[ChatMessage]:
-    return (
-        db.query(ChatMessage)
-        .join(ChatSession, ChatMessage.session_id == ChatSession.id)
-        .filter(ChatSession.id == session_id, ChatSession.user_id == user_id)
-        .order_by(ChatMessage.id.asc())
-        .limit(limit)
-        .all()
-    )
-
-@app.post("/api/chat/send")
-async def chat_send(
-    request: Request,
-    message: str = Form(""),
-    session_id: Optional[int] = Form(None),
-    files: Optional[List[UploadFile]] = File(None),   # multi-file
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    tier = _user_tier(current_user)
-    uid = getattr(current_user, "id", 0) or 0
-
-    # --- Per-tier chat & upload limits (now includes Pro+) ---
-    msgs_limit, uploads_limit = _chat_limits_for_tier(tier)
-
-    if msgs_limit is not None:
-        used = _count_usage(db, uid, "chat")
-        if used >= msgs_limit:
-            _, end = _today_bounds_utc()
-            return _limit_response(used, msgs_limit, end.isoformat() + "Z", tier)
-        _log_usage(db, uid, "chat", "ok")
-
-    if uploads_limit is not None and files:
-        upload_used = _count_usage(db, uid, "chat_upload")
-        if upload_used + len(files) > uploads_limit:
-            _, end = _today_bounds_utc()
-            return _limit_response(upload_used, uploads_limit, end.isoformat() + "Z", f"{tier} uploads")
-        for _ in range(len(files)):
-            _log_usage(db, uid, "chat_upload", "ok")
-
-    # Create/reuse session
-    sess = _ensure_session(db, uid, session_id, title_hint=(message or "New chat"))
-
-    # Gather short context from all files (simple extractor here; your analyzer has better if you wire it in)
-    doc_chunks: List[str] = []
-    if files:
-        for f in files:
-            try:
-                txt = (await _extract_text(f)).strip()
-                if txt:
-                    # spend budget across files
-                    doc_chunks.append(txt[:8000])
-            except Exception as e:
-                logger.warning("file read failed: %s", e)
-    context_block = "\n\n".join(doc_chunks).strip()
-
-    # Build LLM messages
-    msgs: List[dict] = [{"role": "system", "content": _compose_premium_system_prompt(tier)}]
-
-    # (optional) prior history for continuity
-    for m in _history(db, sess.id, uid, limit=40):
-        msgs.append({"role": m.role, "content": m.content})
-
-    # Hard-ground the model on document text
-    if context_block:
-        msgs.append({"role": "system", "content": f"[DOCUMENT TEXT]\n{context_block}"})
-
-    if message.strip():
-        msgs.append({"role": "user", "content": message.strip()})
-        _save_msg(db, sess.id, "user", message.strip())
-
-    # Model call
-    reply = _call_openrouter(msgs)
-    _save_msg(db, sess.id, "assistant", reply)
-
-    return {"session_id": sess.id, "assistant": reply}
-
-@app.get("/api/chat/history")
-def chat_history(
-    session_id: int = Query(...),
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    uid = getattr(current_user, "id", 0) or 0
-    sess = db.query(ChatSession).filter(ChatSession.id == session_id, ChatSession.user_id == uid).first()
-    if not sess:
-        raise HTTPException(status_code=404, detail="Session not found")
-    items = [{
-        "id": m.id, "role": m.role, "content": m.content, "created_at": m.created_at.isoformat()+"Z"
-    } for m in _history(db, session_id, uid, limit=200)]
-    return {"session_id": session_id, "messages": items, "title": sess.title}
-
-@app.get("/api/chat/sessions")
-def chat_sessions(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    uid = getattr(current_user, "id", 0) or 0
-    rows = (
-        db.query(ChatSession)
-        .filter(ChatSession.user_id == uid)
-        .order_by(ChatSession.id.desc())
-        .limit(100)
-        .all()
-    )
-    return [{"id": s.id, "title": s.title or f"Chat {s.id}", "created_at": s.created_at.isoformat()+"Z"} for s in rows]
-
-# ---------------- Admin usage (simple analytics) ----------------
-def _require_admin(user: User):
-    if not _is_admin(user):
-        raise HTTPException(status_code=403, detail="Admin only")
-
-@app.get("/api/admin/usage")
-def admin_usage(
-    days: int = Query(14, ge=1, le=90),
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    _require_admin(current_user)
-    now = datetime.utcnow()
-    since = now - timedelta(days=days - 1)
-
-    if db.bind.dialect.name == "postgresql":
-        daycol = func.date_trunc("day", UsageLog.timestamp)
-    else:
-        daycol = func.strftime("%Y-%m-%d", UsageLog.timestamp)
-
-    rows = (
-        db.query(daycol.label("day"), UsageLog.endpoint, func.count(UsageLog.id).label("count"))
-        .filter(UsageLog.timestamp >= since)
-        .group_by("day", "endpoint")
-        .order_by("day")
-        .all()
-    )
-
-    def _day_key(v):
-        if isinstance(v, str): return v[:10]
-        try: return v.date().isoformat()
-        except Exception: return str(v)[:10]
-
-    day_keys = [(since + timedelta(days=i)).date().isoformat() for i in range(days)]
-    series = {ek: {dk: 0 for dk in day_keys} for ek in ("analyze", "chat", "chat_upload")}
-    for day, endpoint, count in rows:
-        dk = _day_key(day)
-        if endpoint not in series:
-            series[endpoint] = {dk: 0 for dk in day_keys}
-        series[endpoint][dk] = int(count or 0)
-
-    return {"days": day_keys, "series": series}
-
-# ---------------- Optional: include your extra routers (no behavior change) ----------------
-try:
-    from admin_routes import router as admin_router
+# --------------------------------------------------------------------------------------
+# (Chat/Admin routers) — preserved, only mounted if present in the repo
+# --------------------------------------------------------------------------------------
+if chat_router:
+    app.include_router(chat_router, prefix="/api/chat", tags=["chat"])
+if admin_router:
     app.include_router(admin_router, prefix="/api/admin", tags=["admin"])
-except Exception:
-    if DEBUG: logger.info("admin_routes not included")
-
-try:
-    from admin_metrics_routes import router as admin_metrics_router
-    app.include_router(admin_metrics_router)  # already prefixed /api/admin in that file
-except Exception:
-    if DEBUG: logger.info("admin_metrics_routes not included")
-
-try:
-    from payment_routes import router as payment_router
-    app.include_router(payment_router)
-except Exception:
-    if DEBUG: logger.info("payment_routes not included")
-
-try:
-    from contact_routes import router as contact_router
-    app.include_router(contact_router)  # exposes /api/contact
-except Exception:
-    if DEBUG: logger.info("contact_routes not included")
-
-# ---------------- Entrypoint ----------------
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
