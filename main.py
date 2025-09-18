@@ -132,7 +132,7 @@ def _env_set(name: str) -> set:
     raw = os.getenv(name, "")
     return {e.strip().lower() for e in raw.split(",") if e.strip()}
 
-ADMIN_EMAILS      = _env_set("ADMIN_EMAIL")
+ADMIN_EMAIL      = _env_set("ADMIN_EMAIL")
 PREMIUM_EMAILS    = _env_set("PREMIUM_EMAILS")
 PRO_PLUS_EMAILS   = _env_set("PRO_PLUS_EMAILS")
 PRO_TEST_EMAILS   = _env_set("PRO_TEST_EMAILS")
@@ -197,7 +197,7 @@ def _user_tier(u: User) -> str:
         return explicit
     if not email:
         return "demo"
-    if email in ADMIN_EMAILS:
+    if email in ADMIN_EMAIL:
         return "admin"
     if email in PRO_PLUS_EMAILS:
         return "pro_plus"
@@ -315,7 +315,7 @@ async def login(request: Request, db: Session = Depends(get_db)):
     # keep admin/premium flags loosely in sync with env
     changed = False
     if hasattr(user, "is_admin"):
-        admin_now = email in ADMIN_EMAILS
+        admin_now = email in ADMIN_EMAIL
         if bool(user.is_admin) != admin_now:
             user.is_admin = admin_now
             changed = True
