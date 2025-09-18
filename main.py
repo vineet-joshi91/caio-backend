@@ -483,40 +483,80 @@ def profile(current_user: User = Depends(get_current_user)):
     }
 
 # ---------------- Public config (pricing etc.) ----------------
+
 @app.get("/api/public-config")
 def public_config():
     """
-    Keep structure stable for the frontend:
+    Stable shape for the app frontend:
       {
         "currency": "INR"|"USD",
         "plans": {"pro": {"price": int}, "pro_plus": {...}, "premium": {...}},
         "chat_preview": {"enabled": bool, "msgs_per_day": int, "uploads_per_day": int}
       }
     """
+    # pick currency; fall back to USD if an unknown currency is configured
     currency = os.getenv("PAY_DEFAULT_CURRENCY", "INR").upper()
+    table = _load_pricing_from_env()
+    current = table.get(currency) or table.get("USD")
 
-    # Pricing defaults aligned to your Pro-tier target:
-    PRO_PRICE_INR      = int(os.getenv("PRO_PRICE_INR", "1999"))
-    PRO_PRICE_USD      = int(os.getenv("PRO_PRICE_USD", "25"))
-    PRO_PLUS_PRICE_INR = int(os.getenv("PRO_PLUS_PRICE_INR", "3999"))
-    PRO_PLUS_PRICE_USD = int(os.getenv("PRO_PLUS_PRICE_USD", "49"))
-    PREMIUM_PRICE_INR  = int(os.getenv("PREMIUM_PRICE_INR", "7999"))
-    PREMIUM_PRICE_USD  = int(os.getenv("PREMIUM_PRICE_USD", "99"))
-
-    def pick(inr: int, usd: int) -> int:
-        return {"USD": usd, "INR": inr}.get(currency, usd)
+    # Cast to int for stability (your app expects ints here)
+    def _as_int(v):
+        try:
+            return int(round(float(v)))
+        except Exception:
+            return 0
 
     plans = {
-        "pro":      {"price": pick(PRO_PRICE_INR, PRO_PRICE_USD)},
-        "pro_plus": {"price": pick(PRO_PLUS_PRICE_INR, PRO_PLUS_PRICE_USD)},
-        "premium":  {"price": pick(PREMIUM_PRICE_INR, PREMIUM_PRICE_USD)},
+        "pro":      {"price": _as_int(current.get("pro", 0))},
+        "pro_plus": {"price": _as_int(current.get("pro_plus", 0))},
+        "premium":  {"price": _as_int(current.get("premium", 0))},
     }
+
     chat_preview = {
         "enabled": True,
         "msgs_per_day": FREE_CHAT_MSGS_PER_DAY,
         "uploads_per_day": FREE_CHAT_UPLOADS_PER_DAY,
     }
+
     return {"currency": currency, "plans": plans, "chat_preview": chat_preview}
+
+
+# --- Pricing loader used by both /api/pricing and /api/public-config ---
+def _load_pricing_from_env():
+    """
+    Returns a dict like:
+    {
+      "INR": {"symbol":"₹","pro":1999,"pro_plus":3999,"premium":7999},
+      "USD": {"symbol":"$","pro":25,"pro_plus":49,"premium":99}
+    }
+    Prefers PRICING_JSON; falls back to individual env vars.
+    """
+    raw = os.getenv("PRICING_JSON", "").strip()
+    if raw:
+        try:
+            data = json.loads(raw)
+            # basic shape sanity
+            if isinstance(data, dict) and "INR" in data and "USD" in data:
+                return data
+        except Exception:
+            pass
+
+    # fallback to discrete env vars
+    return {
+        "INR": {
+            "symbol": "₹",
+            "pro": int(os.getenv("PRO_PRICE_INR", "1999") or 1999),
+            "pro_plus": int(os.getenv("PRO_PLUS_PRICE_INR", "3999") or 3999),
+            "premium": int(os.getenv("PREMIUM_PRICE_INR", "7999") or 7999),
+        },
+        "USD": {
+            "symbol": "$",
+            "pro": float(os.getenv("PRO_PRICE_USD", "25") or 25),
+            "pro_plus": float(os.getenv("PRO_PLUS_PRICE_USD", "49") or 49),
+            "premium": float(os.getenv("PREMIUM_PRICE_USD", "99") or 99),
+        },
+    }
+
 
 # ---------------- Analyzer ----------------
 DEFAULT_BRAINS_ORDER = ["CFO","CHRO","COO","CMO","CPO"]
