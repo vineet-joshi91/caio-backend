@@ -1,15 +1,13 @@
 # -*- coding: utf-8 -*-
-# main.py — CAIO Backend (resilient startup, stable routes, admin search)
+# main.py — CAIO Backend (resilient startup, stable routes, chat+admin fixes)
 
 import os
-import re
 import json
 import asyncio
 import logging
 import traceback
-from io import BytesIO
 from datetime import datetime, timedelta
-from typing import Optional, Tuple, List, Dict, Any
+from typing import Optional, Tuple, Dict, Any, List
 from contextlib import asynccontextmanager
 
 from fastapi import (
@@ -20,21 +18,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy import func
-# from pydantic import BaseModel  # (keep if you add models later)
 
 # ---- Project modules (must exist) ----
 from db import get_db, User, init_db, UsageLog, ChatSession, ChatMessage
 from auth import create_access_token, verify_password, get_password_hash, get_current_user
-
-# Optional routers (don’t fail boot if missing)
-try:
-    from routers import chat_router   # type: ignore
-except Exception:
-    chat_router = None
-try:
-    from routers import admin_router  # type: ignore
-except Exception:
-    admin_router = None
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("caio")
@@ -49,10 +36,6 @@ STARTUP_ERROR = ""
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """
-    Warm DB with retries; never hard-crash. If something fails during startup,
-    capture the traceback and still serve /api/ready so you can see the error.
-    """
     global DB_READY, STARTUP_OK, STARTUP_ERROR
     tries = int(os.getenv("DB_WARMUP_TRIES", "20"))
     delay = float(os.getenv("DB_WARMUP_DELAY", "1.5"))
@@ -72,11 +55,10 @@ async def lifespan(app: FastAPI):
         STARTUP_OK = False
         STARTUP_ERROR = traceback.format_exc()
         logger.error("Startup failed:\n%s", STARTUP_ERROR)
-        # still yield so health/ready respond with details
         yield
 
 
-app = FastAPI(title="CAIO Backend", version="0.6.0", lifespan=lifespan)
+app = FastAPI(title="CAIO Backend", version="0.7.0", lifespan=lifespan)
 
 # --------------------------------------------------------------------------------------
 # CORS
@@ -101,6 +83,7 @@ app.add_middleware(
     max_age=86400,
 )
 
+# Preflight helper (does NOT cause 405 for valid routes)
 @app.options("/{path:path}")
 def cors_preflight(path: str):
     return JSONResponse({"ok": True})
@@ -110,11 +93,11 @@ def cors_preflight(path: str):
 # --------------------------------------------------------------------------------------
 @app.get("/")
 def root():
-    return {"ok": True, "service": "caio-backend", "version": "0.6.0"}
+    return {"ok": True, "service": "caio-backend", "version": "0.7.0"}
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "version": "0.6.0"}
+    return {"status": "ok", "version": "0.7.0"}
 
 @app.get("/api/ready")
 def ready():
@@ -133,7 +116,7 @@ def _env_set(name: str) -> set:
     raw = os.getenv(name, "")
     return {e.strip().lower() for e in raw.split(",") if e.strip()}
 
-# Read plural list (primary) and also accept legacy single value
+# admins — accept ADMIN_EMAILS and legacy ADMIN_EMAIL
 ADMIN_EMAILS = _env_set("ADMIN_EMAILS")
 _admin_single = (os.getenv("ADMIN_EMAIL") or "").strip().lower()
 if _admin_single:
@@ -142,7 +125,7 @@ if _admin_single:
 PREMIUM_EMAILS  = _env_set("PREMIUM_EMAILS")
 PRO_PLUS_EMAILS = _env_set("PRO_PLUS_EMAILS")
 PRO_TEST_EMAILS = _env_set("PRO_TEST_EMAILS")
-PRO_TEST_EMAILS_HARDCODE = {"testpro@123.com"}  # legacy tester id
+PRO_TEST_EMAILS_HARDCODE = {"testpro@123.com"}
 
 def _bool_env(name: str, default: bool = False) -> bool:
     v = (os.getenv(name, "").strip().lower())
@@ -154,15 +137,12 @@ PRO_TEST_ENABLE        = _bool_env("PRO_TEST_ENABLE", True)
 PRO_TEST_AUTO_CREATE   = _bool_env("PRO_TEST_AUTO_CREATE", True)
 PRO_TEST_DEFAULT_PW    = os.getenv("PRO_TEST_DEFAULT_PASSWORD", "testpro123")
 
-# “Free/Trial” caps (fallbacks to TRIAL_* or small defaults)
 FREE_CHAT_MSGS_PER_DAY    = int(os.getenv("FREE_CHAT_MSGS_PER_DAY", os.getenv("TRIAL_MAX_MSGS", "3")))
 FREE_CHAT_UPLOADS_PER_DAY = int(os.getenv("FREE_CHAT_UPLOADS_PER_DAY", os.getenv("TRIAL_MAX_MSGS", "3")))
-
 FREE_QUERIES_PER_DAY = int(os.getenv("FREE_QUERIES_PER_DAY", "3"))
 FREE_UPLOADS         = int(os.getenv("FREE_UPLOADS", "3"))
 FREE_BRAINS          = int(os.getenv("FREE_BRAINS", "2"))
 
-# usage helpers
 def _today_bounds_utc() -> Tuple[datetime, datetime]:
     now = datetime.utcnow()
     start = datetime(now.year, now.month, now.day)
@@ -182,77 +162,41 @@ def _log_usage(db: Session, user_id: int, endpoint: str, status: str = "ok", met
     db.add(UsageLog(user_id=user_id or 0, timestamp=datetime.utcnow(), endpoint=endpoint, status=status, meta=meta))
     db.commit()
 
-def _limit_response(used: int, limit: int, reset_at: Optional[str], plan: str):
-    return JSONResponse({
-        "status": "error",
-        "title": "Daily limit reached",
-        "message": f"You've used {used}/{limit} {plan.capitalize()} requests today.",
-        "plan": plan,
-        "used": used,
-        "limit": limit,
-        "reset_at": reset_at,
-    }, status_code=429)
-
-# ---- tier helpers ----
 def _user_tier(u: User) -> str:
     email = (getattr(u, "email", "") or "").lower()
-
-    # 1) Absolute precedence by email lists
     if email in ADMIN_EMAILS:
         return "admin"
     if email in PRO_PLUS_EMAILS:
         return "pro_plus"
     if email in PREMIUM_EMAILS:
         return "premium"
-
-    # 2) Respect explicit DB tier if present (after email-based precedence)
     explicit = getattr(u, "tier", None)
     if isinstance(explicit, str) and explicit in ("admin", "premium", "pro_plus", "pro", "demo"):
         return explicit
-
-    # 3) Fallbacks
     if getattr(u, "is_paid", False):
         return "pro"
-    if not email:
-        return "demo"
-    return "demo"
-
-def _is_admin(u: User) -> bool:
-    return _user_tier(u) == "admin"
+    return "demo" if email else "demo"
 
 def apply_tier_overrides(user: User) -> User:
-    """
-    QA override for tester emails:
-      - Never touch admins.
-      - Do not set `user.tier`; only set `is_paid=True` so they behave like Pro.
-    """
     try:
         email = (user.email or "").lower()
         if email in ADMIN_EMAILS:
-            return user  # admin always stays admin
-
+            return user
         allow = _env_set("PRO_TEST_EMAILS") | PRO_TEST_EMAILS_HARDCODE
         if PRO_TEST_ENABLE and email in allow:
-            user.is_paid = True  # transient behavior; tier derived by _user_tier()
+            user.is_paid = True
     except Exception:
         pass
     return user
 
 # --------------------------------------------------------------------------------------
-# Auth — robust JSON or form parsing; tester auto-create; stable token shape
+# Auth
 # --------------------------------------------------------------------------------------
 @app.post("/api/login")
 async def login(request: Request, db: Session = Depends(get_db)):
-    """
-    Accept BOTH form (application/x-www-form-urlencoded or multipart) and JSON.
-    If an allowed tester email signs in and doesn't exist, optionally auto-create.
-    Always returns {"access_token": "...", "token_type": "bearer"}.
-    """
     email = ""
     password = ""
     ctype = (request.headers.get("content-type") or "").lower()
-
-    # parse body
     try:
         if ctype.startswith("application/json"):
             data = await request.json()
@@ -278,7 +222,6 @@ async def login(request: Request, db: Session = Depends(get_db)):
 
     if not user:
         if is_tester and PRO_TEST_AUTO_CREATE:
-            # auto-provision with provided password (or default)
             hashed = get_password_hash(password or PRO_TEST_DEFAULT_PW)
             user = User(
                 email=email,
@@ -291,12 +234,10 @@ async def login(request: Request, db: Session = Depends(get_db)):
         else:
             raise HTTPException(status_code=401, detail="User not found")
 
-    # password check (permit testers using default)
     if not verify_password(password, user.hashed_password):
         if not (is_tester and PRO_TEST_DEFAULT_PW and verify_password(PRO_TEST_DEFAULT_PW, user.hashed_password)):
             raise HTTPException(status_code=401, detail="Incorrect email or password")
 
-    # keep admin/premium flags loosely in sync with env
     changed = False
     if hasattr(user, "is_admin"):
         admin_now = email in ADMIN_EMAILS
@@ -311,18 +252,12 @@ async def login(request: Request, db: Session = Depends(get_db)):
     if changed:
         db.commit()
 
-    # non-persistent QA override
     user = apply_tier_overrides(user)
-
     token = create_access_token(email)
     return {"access_token": token, "token_type": "bearer"}
 
 @app.post("/api/signup")
 async def signup(request: Request, db: Session = Depends(get_db)):
-    """
-    Create a new user account (JSON or form-data).
-    Returns: {"ok": True, "user": {"id", "email"}, "access_token", "token_type"}.
-    """
     try:
         email = ""
         password = ""
@@ -351,17 +286,13 @@ async def signup(request: Request, db: Session = Depends(get_db)):
             created_at=datetime.utcnow(),
         )
         db.add(user)
-        db.flush()   # surface constraint violations before commit
+        db.flush()
         db.commit()
         db.refresh(user)
 
         access_token = create_access_token(user.email)
-        return {
-            "ok": True,
-            "user": {"id": user.id, "email": user.email},
-            "access_token": access_token,
-            "token_type": "bearer",
-        }
+        return {"ok": True, "user": {"id": user.id, "email": user.email},
+                "access_token": access_token, "token_type": "bearer"}
 
     except IntegrityError:
         db.rollback()
@@ -373,35 +304,17 @@ async def signup(request: Request, db: Session = Depends(get_db)):
         logger.error("signup failed:\n%s", traceback.format_exc())
         raise HTTPException(status_code=500, detail="Signup failed on the server. Please try again.")
 
-# --------------------------------------------------------------------------------------
-# Profile — minimal shape the frontend expects
-# --------------------------------------------------------------------------------------
 @app.get("/api/profile")
 def profile(current: User = Depends(get_current_user)):
-    """
-    Return minimal profile; keep key names stable.
-    """
     u = apply_tier_overrides(current)
     tier = _user_tier(u)
-    return {
-        "email": u.email,
-        "tier": tier,
-        "is_admin": (tier == "admin"),
-        "created_at": getattr(u, "created_at", None),
-    }
+    return {"email": u.email, "tier": tier, "is_admin": (tier == "admin"),
+            "created_at": getattr(u, "created_at", None)}
 
 # --------------------------------------------------------------------------------------
-# Pricing (shared loader) + endpoints: /api/public-config (stable) & /api/pricing
+# Pricing
 # --------------------------------------------------------------------------------------
 def _load_pricing_from_env() -> Dict[str, Dict[str, Any]]:
-    """
-    Returns:
-      {
-        "INR": {"symbol":"₹","pro":1999,"pro_plus":3999,"premium":7999},
-        "USD": {"symbol":"$","pro":25,"pro_plus":49,"premium":99}
-      }
-    Prefers PRICING_JSON; falls back to individual env vars.
-    """
     raw = (os.getenv("PRICING_JSON") or "").strip()
     if raw:
         try:
@@ -409,20 +322,16 @@ def _load_pricing_from_env() -> Dict[str, Dict[str, Any]]:
             if isinstance(data, dict) and "INR" in data and "USD" in data:
                 return data
         except Exception:
-            logger.warning("Failed to parse PRICING_JSON; falling back to discrete env vars.")
+            logger.warning("Failed to parse PRICING_JSON; using discrete env vars.")
     return {
-        "INR": {
-            "symbol": "₹",
-            "pro": int(os.getenv("PRO_PRICE_INR", "1999") or 1999),
-            "pro_plus": int(os.getenv("PRO_PLUS_PRICE_INR", "3999") or 3999),
-            "premium": int(os.getenv("PREMIUM_PRICE_INR", "7999") or 7999),
-        },
-        "USD": {
-            "symbol": "$",
-            "pro": float(os.getenv("PRO_PRICE_USD", "25") or 25),
-            "pro_plus": float(os.getenv("PRO_PLUS_PRICE_USD", "49") or 49),
-            "premium": float(os.getenv("PREMIUM_PRICE_USD", "99") or 99),
-        },
+        "INR": {"symbol": "₹",
+                "pro": int(os.getenv("PRO_PRICE_INR", "1999") or 1999),
+                "pro_plus": int(os.getenv("PRO_PLUS_PRICE_INR", "3999") or 3999),
+                "premium": int(os.getenv("PREMIUM_PRICE_INR", "7999") or 7999)},
+        "USD": {"symbol": "$",
+                "pro": float(os.getenv("PRO_PRICE_USD", "25") or 25),
+                "pro_plus": float(os.getenv("PRO_PLUS_PRICE_USD", "49") or 49),
+                "premium": float(os.getenv("PREMIUM_PRICE_USD", "99") or 99)},
     }
 
 @app.get("/api/pricing")
@@ -432,14 +341,6 @@ def public_pricing():
 
 @app.get("/api/public-config")
 def public_config():
-    """
-    Keep structure stable for the frontend:
-      {
-        "currency": "INR"|"USD",
-        "plans": {"pro": {"price": int}, "pro_plus": {...}, "premium": {...}},
-        "chat_preview": {"enabled": bool, "msgs_per_day": int, "uploads_per_day": int}
-      }
-    """
     currency = (os.getenv("PAY_DEFAULT_CURRENCY", "INR") or "INR").upper()
     table = _load_pricing_from_env()
     current = table.get(currency) or table.get("USD")
@@ -451,9 +352,9 @@ def public_config():
             return 0
 
     plans = {
-        "pro":      {"price": _as_int(current.get("pro", 0))},
+        "pro": {"price": _as_int(current.get("pro", 0))},
         "pro_plus": {"price": _as_int(current.get("pro_plus", 0))},
-        "premium":  {"price": _as_int(current.get("premium", 0))},
+        "premium": {"price": _as_int(current.get("premium", 0))},
     }
     chat_preview = {
         "enabled": True,
@@ -463,32 +364,38 @@ def public_config():
     return {"currency": currency, "plans": plans, "chat_preview": chat_preview}
 
 # --------------------------------------------------------------------------------------
-# Admin guard + Admin endpoints (summary + search) — accept GET and POST
+# Admin (accept GET and POST)
 # --------------------------------------------------------------------------------------
 def _require_admin(u: User):
     if _user_tier(u) != "admin":
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin only")
 
-async def _admin_users_search_impl(
-    request: Request,
-    q: Optional[str],
-    page: int,
-    page_size: int,
-    db: Session,
-    current: User,
-):
+@app.api_route("/api/admin/users/summary", methods=["GET", "POST"])
+def admin_users_summary(db: Session = Depends(get_db), current: User = Depends(get_current_user)):
     _require_admin(current)
+    users = db.query(User).all()
+    total = len(users); demo = pro = pro_plus = 0; premium_admin = 0
+    for u in users:
+        t = _user_tier(apply_tier_overrides(u))
+        if t == "demo": demo += 1
+        elif t == "pro": pro += 1
+        elif t == "pro_plus": pro_plus += 1
+        if t in ("admin", "premium"):
+            premium_admin += 1
+    return {"ok": True, "total": total, "demo": demo, "pro": pro, "pro_plus": pro_plus,
+            "premium_admin": premium_admin, "time": datetime.utcnow().isoformat() + "Z"}
 
-    # If POST with form/json, prefer body values
+async def _admin_users_search_impl(request: Request, q: Optional[str], page: int, page_size: int,
+                                   db: Session, current: User):
+    _require_admin(current)
     ct = (request.headers.get("content-type") or "").lower()
     if request.method.upper() == "POST":
         try:
             if "application/json" in ct:
                 data = await request.json()
-                if isinstance(data, dict):
-                    q = (data.get("q") or q or "").strip()
-                    page = int(data.get("page") or page or 1)
-                    page_size = int(data.get("page_size") or page_size or 25)
+                q = (data.get("q") or q or "").strip()
+                page = int(data.get("page") or page or 1)
+                page_size = int(data.get("page_size") or page_size or 25)
             else:
                 form = await request.form()
                 q = (form.get("q") or q or "").strip()
@@ -498,41 +405,27 @@ async def _admin_users_search_impl(
             pass
 
     q = (q or "").strip().lower()
-    page = max(1, int(page))
-    page_size = max(1, min(200, int(page_size)))
+    page = max(1, int(page)); page_size = max(1, min(200, int(page_size)))
 
-    base_q = db.query(User)
+    query = db.query(User)
     if q:
-        base_q = base_q.filter(func.lower(User.email).like(f"%{q}%"))
+        query = query.filter(func.lower(User.email).like(f"%{q}%"))
 
-    total = base_q.count()
-    rows = (
-        base_q
-        .order_by(User.created_at.desc() if hasattr(User, "created_at") else User.id.desc())
-        .offset((page - 1) * page_size)
-        .limit(page_size)
-        .all()
-    )
+    total = query.count()
+    rows = (query
+            .order_by(User.created_at.desc() if hasattr(User, "created_at") else User.id.desc())
+            .offset((page - 1) * page_size).limit(page_size).all())
 
-    # last_seen from ChatMessage; sessions count from ChatSession
     last_seen_map: Dict[int, Optional[str]] = {}
     sessions_map: Dict[int, int] = {}
     try:
-        ls = (
-            db.query(ChatMessage.user_id, func.max(ChatMessage.created_at))
-            .group_by(ChatMessage.user_id)
-            .all()
-        )
+        ls = db.query(ChatMessage.user_id, func.max(ChatMessage.created_at)).group_by(ChatMessage.user_id).all()
         for uid, dt in ls:
             last_seen_map[int(uid)] = (dt.isoformat() if dt else None)
     except Exception:
         pass
     try:
-        ses = (
-            db.query(ChatSession.user_id, func.count(ChatSession.id))
-            .group_by(ChatSession.user_id)
-            .all()
-        )
+        ses = db.query(ChatSession.user_id, func.count(ChatSession.id)).group_by(ChatSession.user_id).all()
         for uid, cnt in ses:
             sessions_map[int(uid)] = int(cnt or 0)
     except Exception:
@@ -549,47 +442,9 @@ async def _admin_users_search_impl(
             "created_at": (u.created_at.isoformat() if hasattr(u, "created_at") and u.created_at else None),
             "last_seen": last_seen_map.get(uid),
             "total_sessions": sessions_map.get(uid, 0),
-            "tokens_used": 0,  # Placeholder unless you track tokens in UsageLog.meta
+            "tokens_used": 0,
         })
-
-    return {
-        "ok": True,
-        "q": q,
-        "page": page,
-        "page_size": page_size,
-        "total": total,
-        "items": items,
-    }
-
-@app.api_route("/api/admin/users/summary", methods=["GET", "POST"])
-def admin_users_summary(db: Session = Depends(get_db), current: User = Depends(get_current_user)):
-    _require_admin(current)
-
-    users = db.query(User).all()
-    total = len(users)
-    demo = pro = pro_plus = 0
-    premium_admin = 0
-
-    for u in users:
-        t = _user_tier(apply_tier_overrides(u))
-        if t == "demo":
-            demo += 1
-        elif t == "pro":
-            pro += 1
-        elif t == "pro_plus":
-            pro_plus += 1
-        if t in ("admin", "premium"):
-            premium_admin += 1
-
-    return {
-        "ok": True,
-        "total": total,
-        "demo": demo,
-        "pro": pro,
-        "pro_plus": pro_plus,
-        "premium_admin": premium_admin,
-        "time": datetime.utcnow().isoformat() + "Z",
-    }
+    return {"ok": True, "q": q, "page": page, "page_size": page_size, "total": total, "items": items}
 
 @app.api_route("/api/admin/users/search", methods=["GET", "POST"])
 async def admin_users_search(
@@ -602,7 +457,6 @@ async def admin_users_search(
 ):
     return await _admin_users_search_impl(request, q, page, page_size, db, current)
 
-# Alias some UIs might call
 @app.api_route("/api/admin/users", methods=["GET", "POST"])
 async def admin_users_alias(
     request: Request,
@@ -615,9 +469,188 @@ async def admin_users_alias(
     return await _admin_users_search_impl(request, q, page, page_size, db, current)
 
 # --------------------------------------------------------------------------------------
-# (Chat/Admin routers) — only mounted if present in the repo
+# Chat minimal endpoints (to stop 405s and integrate with sidebar)
 # --------------------------------------------------------------------------------------
-if chat_router:
-    app.include_router(chat_router, prefix="/api/chat", tags=["chat"])
-if admin_router:
-    app.include_router(admin_router, prefix="/api/admin", tags=["admin"])
+
+def _mk_session(db: Session, user_id: int) -> ChatSession:
+    s = ChatSession(user_id=user_id, created_at=datetime.utcnow())
+    db.add(s); db.commit(); db.refresh(s)
+    return s
+
+def _mk_message(db: Session, session_id: int, user_id: int, role: str, content: str):
+    m = ChatMessage(session_id=session_id, user_id=user_id, role=role,
+                    content=content, created_at=datetime.utcnow())
+    db.add(m); db.commit(); db.refresh(m)
+    return m
+
+@app.get("/api/chat/sessions")
+def chat_sessions(db: Session = Depends(get_db), current: User = Depends(get_current_user)):
+    """
+    Return recent sessions for the sidebar.
+    """
+    ses = (db.query(ChatSession)
+           .filter(ChatSession.user_id == current.id)
+           .order_by(ChatSession.created_at.desc())
+           .limit(25)
+           .all())
+    out = []
+    for s in ses:
+        last = (db.query(func.max(ChatMessage.created_at))
+                  .filter(ChatMessage.session_id == s.id).scalar())
+        out.append({
+            "id": s.id,
+            "created_at": s.created_at.isoformat() if s.created_at else None,
+            "last_message_at": last.isoformat() if last else None,
+        })
+    return {"ok": True, "sessions": out}
+
+@app.post("/api/chat/send")
+async def chat_send(
+    request: Request,
+    db: Session = Depends(get_db),
+    current: User = Depends(get_current_user),
+    message: Optional[str] = Form(None),
+    brief: Optional[str] = Form(None),
+    session_id: Optional[int] = Form(None),
+):
+    """
+    Returns: Insights (top) + CXO-only Recommendations for CFO/CHRO/COO/CMO/CPO.
+    Uses filenames + brief/message to craft lightweight, deterministic output so the UI renders
+    the same structure across tiers. You can swap the inner 'assistant_content' with your LLM
+    answer later without touching the response shape.
+    """
+    user = apply_tier_overrides(current)
+    tier = _user_tier(user)
+
+    # Parse multipart to capture filenames if present (no hard dependency on files)
+    filenames: List[str] = []
+    try:
+        form = await request.form()
+        for v in form.values():
+            if hasattr(v, "filename") and getattr(v, "filename"):
+                filenames.append(v.filename)
+        # fallback to explicit message/brief if body was multipart
+        if message is None:
+            message = form.get("message")
+        if brief is None:
+            brief = form.get("brief")
+        if session_id is None:
+            sid = form.get("session_id")
+            session_id = int(sid) if sid else None
+    except Exception:
+        pass
+
+    # ensure session
+    s: Optional[ChatSession] = None
+    if session_id:
+        s = db.query(ChatSession).filter(ChatSession.id == session_id,
+                                         ChatSession.user_id == user.id).first()
+    if not s:
+        s = ChatSession(user_id=user.id, created_at=datetime.utcnow())
+        db.add(s); db.commit(); db.refresh(s)
+
+    # persist user message
+    user_text = (message or brief or "").strip()
+    hint = (f"\n\n[files] {', '.join(filenames)}" if filenames else "")
+    umsg = ChatMessage(session_id=s.id, user_id=user.id, role="user",
+                       content=(user_text + hint) if (user_text or hint) else "(no message)",
+                       created_at=datetime.utcnow())
+    db.add(umsg); db.commit()
+
+    # ---------- Lightweight, deterministic “Insights + CXO recs” scaffold ----------
+    # Inputs for flavoring:
+    doc_hint = ", ".join(filenames) if filenames else "attached context"
+    brief_hint = (brief or message or "your document").strip()
+
+    # Top insights (3)
+    insights = [
+        f"The submission includes {('files: ' + doc_hint) if filenames else 'text input only'}, suitable for CXO review.",
+        "Content appears narrative/strategic rather than raw telemetry; summarize themes before diving into metrics.",
+        "Capture any explicit asks in the brief to align next steps and owners.",
+    ]
+
+    # Helper to make 5 crisp, one-line recommendations tailored to the role
+    def recs_for(role: str) -> List[str]:
+        base = brief_hint if brief_hint else "the current context"
+        if role == "CFO":
+            return [
+                f"Validate revenue/expense drivers referenced in {base} against latest actuals.",
+                "Set a weekly variance check and flag deltas >3% to the owner.",
+                "Tighten working capital — review AR aging and vendor terms.",
+                "Pressure-test unit economics; agree the one true CAC/LTV view.",
+                "Publish a one-page runway/threshold update for the exec team.",
+            ]
+        if role == "CHRO":
+            return [
+                "Map roles to outcomes; clarify ‘must-win’ competencies this quarter.",
+                "Launch a pulse check; track participation and eNPS by function.",
+                "Pre-brief managers on upcoming changes; supply talking points.",
+                "Create a hiring freeze exception path tied to business impact.",
+                "Stand up an attrition review: leavers by tenure/manager/root cause.",
+            ]
+        if role == "COO":
+            return [
+                "Instrument the critical path; surface SLA breaches daily.",
+                f"Create a doc-to-ops handoff checklist specific to {base}.",
+                "Run a 5-whys on the slowest hop and remove one constraint.",
+                "Add QA spot-checks on high-variance work items.",
+                "Publish a weekly ‘cost-to-serve’ snapshot with trend arrows.",
+            ]
+        if role == "CMO":
+            return [
+                "Align messaging with the top three buyer pains surfaced here.",
+                "Commit one growth loop (referrals, content, partner) and own it.",
+                "Tidy the funnel; fix drop-offs with one experiment per stage.",
+                "Enforce UTM hygiene; centralize campaign ROI in one view.",
+                "Stand up a churn save motion for at-risk segments.",
+            ]
+        # CPO = Chief People Officer (your requested 5th brain)
+        return [
+            "Clarify success profile per role; share example work samples.",
+            "Shorten time-to-hire: pre-book panels and scorecards.",
+            "Upskill managers on feedback that moves performance quickly.",
+            "Codify onboarding ‘day-1 to day-30’ outcomes and buddies.",
+            "Track diversity of pipeline and close gaps with targeted sourcing.",
+        ]
+
+    # Build CXO sections — recommendations only
+    CXOS = [
+        ("CFO",  "Chief Financial Officer"),
+        ("CHRO", "Chief Human Resources Officer"),
+        ("COO",  "Chief Operating Officer"),
+        ("CMO",  "Chief Marketing Officer"),
+        ("CPO",  "Chief People Officer"),
+    ]
+
+    lines: List[str] = []
+    lines.append("## Insights")
+    for i, bullet in enumerate(insights, 1):
+        lines.append(f"{i}. {bullet}")
+    lines.append("")  # spacer
+
+    for code, full in CXOS:
+        lines.append(f"### {code} ({full})")
+        lines.append("**Recommendations**")
+        for i, r in enumerate(recs_for(code), 1):
+            lines.append(f"{i}. {r}")
+        lines.append("")  # spacer between CXOs
+
+    assistant_content = "\n".join(lines)
+
+    # Gate only if you want different behavior by tier; for now we show same
+    # structure to all tiers so Premium/Pro+ get the full CXO output consistently.
+
+    # persist assistant message
+    amsg = ChatMessage(session_id=s.id, user_id=user.id, role="assistant",
+                       content=assistant_content, created_at=datetime.utcnow())
+    db.add(amsg); db.commit()
+
+    return {
+        "ok": True,
+        "session_id": s.id,
+        "assistant": {"role": "assistant", "content": assistant_content},
+    }
+
+# --------------------------------------------------------------------------------------
+# (No external router mounting required; endpoints above match your UI paths)
+# --------------------------------------------------------------------------------------
