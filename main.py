@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# main.py — CAIO Backend (resilient startup, stable routes, pricing endpoints)
+# main.py — CAIO Backend (resilient startup, stable routes, admin search)
 
 import os
 import re
@@ -13,33 +13,34 @@ from typing import Optional, Tuple, List, Dict, Any
 from contextlib import asynccontextmanager
 
 from fastapi import (
-    FastAPI, Depends, HTTPException, UploadFile, File, Form, Request, Query
+    FastAPI, Depends, HTTPException, UploadFile, File, Form, Request, Query, status
 )
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
-from pydantic import BaseModel
+from sqlalchemy import func
+# from pydantic import BaseModel  # (keep if you add models later)
 
-# ---- Project modules (must exist in your repo) ----
+# ---- Project modules (must exist) ----
 from db import get_db, User, init_db, UsageLog, ChatSession, ChatMessage
 from auth import create_access_token, verify_password, get_password_hash, get_current_user
 
-# Optional routers (don’t fail boot if they’re absent)
+# Optional routers (don’t fail boot if missing)
 try:
     from routers import chat_router   # type: ignore
 except Exception:
-    chat_router = None  # noqa: E305
+    chat_router = None
 try:
     from routers import admin_router  # type: ignore
 except Exception:
-    admin_router = None  # noqa: E305
+    admin_router = None
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("caio")
 
 # --------------------------------------------------------------------------------------
-# Lifespan: resilient startup with diagnostics (appears in /api/ready)
+# Lifespan: resilient startup with diagnostics (visible via /api/ready)
 # --------------------------------------------------------------------------------------
 DB_READY = False
 STARTUP_OK = False
@@ -49,8 +50,8 @@ STARTUP_ERROR = ""
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
-    Keep startup resilient: warm DB with retries; never hard-crash the process.
-    Any exception is captured and exposed via /api/ready for quick diagnosis.
+    Warm DB with retries; never hard-crash. If something fails during startup,
+    capture the traceback and still serve /api/ready so you can see the error.
     """
     global DB_READY, STARTUP_OK, STARTUP_ERROR
     tries = int(os.getenv("DB_WARMUP_TRIES", "20"))
@@ -71,11 +72,11 @@ async def lifespan(app: FastAPI):
         STARTUP_OK = False
         STARTUP_ERROR = traceback.format_exc()
         logger.error("Startup failed:\n%s", STARTUP_ERROR)
-        # still yield so health/ready endpoints respond with details
+        # still yield so health/ready respond with details
         yield
 
 
-app = FastAPI(title="CAIO Backend", version="0.5.0", lifespan=lifespan)
+app = FastAPI(title="CAIO Backend", version="0.6.0", lifespan=lifespan)
 
 # --------------------------------------------------------------------------------------
 # CORS
@@ -109,11 +110,11 @@ def cors_preflight(path: str):
 # --------------------------------------------------------------------------------------
 @app.get("/")
 def root():
-    return {"ok": True, "service": "caio-backend", "version": "0.5.0"}
+    return {"ok": True, "service": "caio-backend", "version": "0.6.0"}
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "version": "0.5.0"}
+    return {"status": "ok", "version": "0.6.0"}
 
 @app.get("/api/ready")
 def ready():
@@ -132,13 +133,16 @@ def _env_set(name: str) -> set:
     raw = os.getenv(name, "")
     return {e.strip().lower() for e in raw.split(",") if e.strip()}
 
-ADMIN_EMAIL      = _env_set("ADMIN_EMAIL")
-PREMIUM_EMAILS    = _env_set("PREMIUM_EMAILS")
-PRO_PLUS_EMAILS   = _env_set("PRO_PLUS_EMAILS")
-PRO_TEST_EMAILS   = _env_set("PRO_TEST_EMAILS")
+# Read plural list (primary) and also accept legacy single value
+ADMIN_EMAILS = _env_set("ADMIN_EMAILS")
+_admin_single = (os.getenv("ADMIN_EMAIL") or "").strip().lower()
+if _admin_single:
+    ADMIN_EMAILS.add(_admin_single)
 
-# hardcoded legacy tester id is allowed but optional
-PRO_TEST_EMAILS_HARDCODE = {"testpro@123.com"}
+PREMIUM_EMAILS  = _env_set("PREMIUM_EMAILS")
+PRO_PLUS_EMAILS = _env_set("PRO_PLUS_EMAILS")
+PRO_TEST_EMAILS = _env_set("PRO_TEST_EMAILS")
+PRO_TEST_EMAILS_HARDCODE = {"testpro@123.com"}  # legacy tester id
 
 def _bool_env(name: str, default: bool = False) -> bool:
     v = (os.getenv(name, "").strip().lower())
@@ -150,7 +154,7 @@ PRO_TEST_ENABLE        = _bool_env("PRO_TEST_ENABLE", True)
 PRO_TEST_AUTO_CREATE   = _bool_env("PRO_TEST_AUTO_CREATE", True)
 PRO_TEST_DEFAULT_PW    = os.getenv("PRO_TEST_DEFAULT_PASSWORD", "testpro123")
 
-# “Free/Trial” preview caps (fallbacks to TRIAL_* or small defaults)
+# “Free/Trial” caps (fallbacks to TRIAL_* or small defaults)
 FREE_CHAT_MSGS_PER_DAY    = int(os.getenv("FREE_CHAT_MSGS_PER_DAY", os.getenv("TRIAL_MAX_MSGS", "3")))
 FREE_CHAT_UPLOADS_PER_DAY = int(os.getenv("FREE_CHAT_UPLOADS_PER_DAY", os.getenv("TRIAL_MAX_MSGS", "3")))
 
@@ -192,18 +196,25 @@ def _limit_response(used: int, limit: int, reset_at: Optional[str], plan: str):
 # ---- tier helpers ----
 def _user_tier(u: User) -> str:
     email = (getattr(u, "email", "") or "").lower()
-    explicit = getattr(u, "tier", None)
-    if isinstance(explicit, str) and explicit in ("admin", "premium", "pro_plus", "pro", "demo"):
-        return explicit
-    if not email:
-        return "demo"
-    if email in ADMIN_EMAIL:
+
+    # 1) Absolute precedence by email lists
+    if email in ADMIN_EMAILS:
         return "admin"
     if email in PRO_PLUS_EMAILS:
         return "pro_plus"
-    if email in PREMIUM_EMAILS or getattr(u, "is_paid", False):
-        # treat any paid flag or premium email as Pro by default (unless pro_plus/premium above)
+    if email in PREMIUM_EMAILS:
+        return "premium"
+
+    # 2) Respect explicit DB tier if present (after email-based precedence)
+    explicit = getattr(u, "tier", None)
+    if isinstance(explicit, str) and explicit in ("admin", "premium", "pro_plus", "pro", "demo"):
+        return explicit
+
+    # 3) Fallbacks
+    if getattr(u, "is_paid", False):
         return "pro"
+    if not email:
+        return "demo"
     return "demo"
 
 def _is_admin(u: User) -> bool:
@@ -211,16 +222,18 @@ def _is_admin(u: User) -> bool:
 
 def apply_tier_overrides(user: User) -> User:
     """
-    QA override: allow emails listed in PRO_TEST_EMAILS (or legacy hardcoded)
-    to behave as Pro without changing persistent billing state.
+    QA override for tester emails:
+      - Never touch admins.
+      - Do not set `user.tier`; only set `is_paid=True` so they behave like Pro.
     """
     try:
-        allow = _env_set("PRO_TEST_EMAILS")
-        allow |= PRO_TEST_EMAILS_HARDCODE
         email = (user.email or "").lower()
+        if email in ADMIN_EMAILS:
+            return user  # admin always stays admin
+
+        allow = _env_set("PRO_TEST_EMAILS") | PRO_TEST_EMAILS_HARDCODE
         if PRO_TEST_ENABLE and email in allow:
-            user.tier = "pro"
-            user.is_paid = True
+            user.is_paid = True  # transient behavior; tier derived by _user_tier()
     except Exception:
         pass
     return user
@@ -228,40 +241,12 @@ def apply_tier_overrides(user: User) -> User:
 # --------------------------------------------------------------------------------------
 # Auth — robust JSON or form parsing; tester auto-create; stable token shape
 # --------------------------------------------------------------------------------------
-def _extract_email_password_from_request(request: Request) -> Tuple[str, str]:
-    email = ""
-    password = ""
-    ctype = (request.headers.get("content-type") or "").lower()
-    async def _try_json():
-        try:
-            data = await request.json()
-            return (
-                (data.get("email") or data.get("username") or "").strip().lower(),
-                data.get("password") or "",
-            )
-        except Exception:
-            return "", ""
-
-    async def _try_form():
-        try:
-            form = await request.form()
-            return (
-                (form.get("email") or form.get("username") or "").strip().lower(),
-                form.get("password") or "",
-            )
-        except Exception:
-            return "", ""
-
-    return asyncio.get_event_loop().run_until_complete(
-        _try_json() if ctype.startswith("application/json") else _try_form()
-    ) or ("", "")
-
 @app.post("/api/login")
 async def login(request: Request, db: Session = Depends(get_db)):
     """
-    Accept BOTH form (application/x-www-form-urlencoded/multipart) and JSON.
+    Accept BOTH form (application/x-www-form-urlencoded or multipart) and JSON.
     If an allowed tester email signs in and doesn't exist, optionally auto-create.
-    Always returns token shape: {"access_token": "...", "token_type": "bearer"}
+    Always returns {"access_token": "...", "token_type": "bearer"}.
     """
     email = ""
     password = ""
@@ -278,7 +263,6 @@ async def login(request: Request, db: Session = Depends(get_db)):
             email = (form.get("email") or form.get("username") or "").strip().lower()
             password = form.get("password") or ""
     except Exception:
-        # last chance: try JSON again
         try:
             data = await request.json()
             email = (data.get("username") or data.get("email") or "").strip().lower()
@@ -315,7 +299,7 @@ async def login(request: Request, db: Session = Depends(get_db)):
     # keep admin/premium flags loosely in sync with env
     changed = False
     if hasattr(user, "is_admin"):
-        admin_now = email in ADMIN_EMAIL
+        admin_now = email in ADMIN_EMAILS
         if bool(user.is_admin) != admin_now:
             user.is_admin = admin_now
             changed = True
@@ -337,7 +321,7 @@ async def login(request: Request, db: Session = Depends(get_db)):
 async def signup(request: Request, db: Session = Depends(get_db)):
     """
     Create a new user account (JSON or form-data).
-    Returns: {"ok": True, "user": {"id", "email"}, "access_token", "token_type"}
+    Returns: {"ok": True, "user": {"id", "email"}, "access_token", "token_type"}.
     """
     try:
         email = ""
@@ -390,12 +374,12 @@ async def signup(request: Request, db: Session = Depends(get_db)):
         raise HTTPException(status_code=500, detail="Signup failed on the server. Please try again.")
 
 # --------------------------------------------------------------------------------------
-# Profile — small helper the frontend expects
+# Profile — minimal shape the frontend expects
 # --------------------------------------------------------------------------------------
 @app.get("/api/profile")
 def profile(current: User = Depends(get_current_user)):
     """
-    Return minimal profile the frontend uses; keep key names stable.
+    Return minimal profile; keep key names stable.
     """
     u = apply_tier_overrides(current)
     tier = _user_tier(u)
@@ -407,7 +391,7 @@ def profile(current: User = Depends(get_current_user)):
     }
 
 # --------------------------------------------------------------------------------------
-# Pricing (shared loader) + endpoints: /api/public-config (stable shape) & /api/pricing
+# Pricing (shared loader) + endpoints: /api/public-config (stable) & /api/pricing
 # --------------------------------------------------------------------------------------
 def _load_pricing_from_env() -> Dict[str, Dict[str, Any]]:
     """
@@ -479,7 +463,159 @@ def public_config():
     return {"currency": currency, "plans": plans, "chat_preview": chat_preview}
 
 # --------------------------------------------------------------------------------------
-# (Chat/Admin routers) — preserved, only mounted if present in the repo
+# Admin guard + Admin endpoints (summary + search) — accept GET and POST
+# --------------------------------------------------------------------------------------
+def _require_admin(u: User):
+    if _user_tier(u) != "admin":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin only")
+
+async def _admin_users_search_impl(
+    request: Request,
+    q: Optional[str],
+    page: int,
+    page_size: int,
+    db: Session,
+    current: User,
+):
+    _require_admin(current)
+
+    # If POST with form/json, prefer body values
+    ct = (request.headers.get("content-type") or "").lower()
+    if request.method.upper() == "POST":
+        try:
+            if "application/json" in ct:
+                data = await request.json()
+                if isinstance(data, dict):
+                    q = (data.get("q") or q or "").strip()
+                    page = int(data.get("page") or page or 1)
+                    page_size = int(data.get("page_size") or page_size or 25)
+            else:
+                form = await request.form()
+                q = (form.get("q") or q or "").strip()
+                page = int(form.get("page") or page or 1)
+                page_size = int(form.get("page_size") or page_size or 25)
+        except Exception:
+            pass
+
+    q = (q or "").strip().lower()
+    page = max(1, int(page))
+    page_size = max(1, min(200, int(page_size)))
+
+    base_q = db.query(User)
+    if q:
+        base_q = base_q.filter(func.lower(User.email).like(f"%{q}%"))
+
+    total = base_q.count()
+    rows = (
+        base_q
+        .order_by(User.created_at.desc() if hasattr(User, "created_at") else User.id.desc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+        .all()
+    )
+
+    # last_seen from ChatMessage; sessions count from ChatSession
+    last_seen_map: Dict[int, Optional[str]] = {}
+    sessions_map: Dict[int, int] = {}
+    try:
+        ls = (
+            db.query(ChatMessage.user_id, func.max(ChatMessage.created_at))
+            .group_by(ChatMessage.user_id)
+            .all()
+        )
+        for uid, dt in ls:
+            last_seen_map[int(uid)] = (dt.isoformat() if dt else None)
+    except Exception:
+        pass
+    try:
+        ses = (
+            db.query(ChatSession.user_id, func.count(ChatSession.id))
+            .group_by(ChatSession.user_id)
+            .all()
+        )
+        for uid, cnt in ses:
+            sessions_map[int(uid)] = int(cnt or 0)
+    except Exception:
+        pass
+
+    items = []
+    for u in rows:
+        tu = apply_tier_overrides(u)
+        tier = _user_tier(tu)
+        uid = int(getattr(u, "id", 0))
+        items.append({
+            "email": u.email,
+            "tier": tier,
+            "created_at": (u.created_at.isoformat() if hasattr(u, "created_at") and u.created_at else None),
+            "last_seen": last_seen_map.get(uid),
+            "total_sessions": sessions_map.get(uid, 0),
+            "tokens_used": 0,  # Placeholder unless you track tokens in UsageLog.meta
+        })
+
+    return {
+        "ok": True,
+        "q": q,
+        "page": page,
+        "page_size": page_size,
+        "total": total,
+        "items": items,
+    }
+
+@app.get("/api/admin/users/summary")
+def admin_users_summary(db: Session = Depends(get_db), current: User = Depends(get_current_user)):
+    _require_admin(current)
+
+    users = db.query(User).all()
+    total = len(users)
+    demo = pro = pro_plus = 0
+    premium_admin = 0
+
+    for u in users:
+        t = _user_tier(apply_tier_overrides(u))
+        if t == "demo":
+            demo += 1
+        elif t == "pro":
+            pro += 1
+        elif t == "pro_plus":
+            pro_plus += 1
+        if t in ("admin", "premium"):
+            premium_admin += 1
+
+    return {
+        "ok": True,
+        "total": total,
+        "demo": demo,
+        "pro": pro,
+        "pro_plus": pro_plus,
+        "premium_admin": premium_admin,
+        "time": datetime.utcnow().isoformat() + "Z",
+    }
+
+@app.api_route("/api/admin/users/search", methods=["GET", "POST"])
+async def admin_users_search(
+    request: Request,
+    q: Optional[str] = Query(None),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(25, ge=1, le=200),
+    db: Session = Depends(get_db),
+    current: User = Depends(get_current_user),
+):
+    return await _admin_users_search_impl(request, q, page, page_size, db, current)
+
+# Alias some UIs might call
+@app.api_route("/api/admin/users", methods=["GET", "POST"])
+async def admin_users_alias(
+    request: Request,
+    q: Optional[str] = Query(None),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(25, ge=1, le=200),
+    db: Session = Depends(get_db),
+    current: User = Depends(get_current_user),
+):
+    return await _admin_users_search_impl(request, q, page, page_size, db, current)
+
+# --------------------------------------------------------------------------------------
+# (Chat/Admin routers) — only mounted if present in the repo
 # --------------------------------------------------------------------------------------
 if chat_router:
     app.include_router(chat_router, prefix="/api/chat", tags=["chat"])
