@@ -61,32 +61,45 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="CAIO Backend", version="0.7.0", lifespan=lifespan)
 
 # --------------------------------------------------------------------------------------
-# CORS
+# CORS (hardened for Vercel/Netlify previews + local dev)
 # --------------------------------------------------------------------------------------
+from fastapi.middleware.cors import CORSMiddleware
+
+# Explicit allowlist (prod + local)
 ALLOWED_ORIGINS = [
     "https://caio-frontend.vercel.app",
     "https://caioai.netlify.app",
     "http://localhost:3000",
     "http://127.0.0.1:3000",
 ]
+
+# Optional comma-separated extras via env (e.g., custom domains)
 extra = (os.getenv("ALLOWED_ORIGINS") or "").strip()
 if extra:
     ALLOWED_ORIGINS += [o.strip() for o in extra.split(",") if o.strip()]
 
+# Regex covers preview deployments like https://<hash>-caio-frontend.vercel.app etc.
+# Also covers Netlify previews.
+ALLOW_ORIGIN_REGEX = r"https://.*\.vercel\.app|https://.*\.netlify\.app"
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=ALLOWED_ORIGINS,      # exact matches
+    allow_origin_regex=ALLOW_ORIGIN_REGEX,  # preview subdomains
+    allow_credentials=True,             # auth header/cookies allowed
+    allow_methods=["*"],                # POST/GET/OPTIONS/etc.
+    allow_headers=["*"],                # Authorization, Content-Type, etc.
     expose_headers=["*"],
     max_age=86400,
 )
 
-# Preflight helper (does NOT cause 405 for valid routes)
+# Robust preflight helper: ensure CORS headers are present even on OPTIONS
+# (Starlette CORS should handle this, but we make it explicit.)
+from fastapi.responses import Response
+
 @app.options("/{path:path}")
 def cors_preflight(path: str):
-    return JSONResponse({"ok": True})
+    return Response(status_code=204)
 
 # --------------------------------------------------------------------------------------
 # Health / Ready
