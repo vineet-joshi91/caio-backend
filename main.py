@@ -483,10 +483,11 @@ def _mk_message(db: Session, session_id: int, user_id: int, role: str, content: 
     db.add(m); db.commit(); db.refresh(m)
     return m
 
-@app.get("/api/chat/sessions")
+@app.api_route("/api/chat/sessions", methods=["GET", "POST"])
 def chat_sessions(db: Session = Depends(get_db), current: User = Depends(get_current_user)):
     """
     Return recent sessions for the sidebar.
+    Supports both GET and POST (frontend uses adaptive method discovery).
     """
     ses = (db.query(ChatSession)
            .filter(ChatSession.user_id == current.id)
@@ -499,10 +500,67 @@ def chat_sessions(db: Session = Depends(get_db), current: User = Depends(get_cur
                   .filter(ChatMessage.session_id == s.id).scalar())
         out.append({
             "id": s.id,
+            "title": f"Chat {s.id}",
             "created_at": s.created_at.isoformat() if s.created_at else None,
             "last_message_at": last.isoformat() if last else None,
         })
     return {"ok": True, "sessions": out}
+
+@app.api_route("/api/chat/history", methods=["GET", "POST"])
+async def chat_history(
+    request: Request,
+    db: Session = Depends(get_db),
+    current: User = Depends(get_current_user),
+):
+    """
+    Returns full message history for a session.
+    - GET:  /api/chat/history?session_id=123
+    - POST: { "session_id": 123 }  (application/json) OR form-data
+    """
+    session_id = None
+    method = request.method.upper()
+    try:
+        if method == "GET":
+            session_id = request.query_params.get("session_id")
+        else:
+            ct = (request.headers.get("content-type") or "").lower()
+            if "application/json" in ct:
+                data = await request.json()
+                session_id = (data.get("session_id") if isinstance(data, dict) else None)
+            else:
+                form = await request.form()
+                session_id = form.get("session_id")
+        if not session_id:
+            raise HTTPException(status_code=400, detail="Missing session_id")
+        session_id = int(session_id)
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid session_id")
+
+    session = db.query(ChatSession).filter(
+        ChatSession.id == session_id,
+        ChatSession.user_id == current.id
+    ).first()
+
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    messages = db.query(ChatMessage).filter(
+        ChatMessage.session_id == session_id
+    ).order_by(ChatMessage.created_at.asc()).all()
+
+    return {
+        "ok": True,
+        "messages": [
+            {
+                "id": m.id,
+                "role": m.role,
+                "content": m.content,
+                "created_at": m.created_at.isoformat() if m.created_at else None,
+            } for m in messages
+        ]
+    }
 
 @app.post("/api/chat/send")
 async def chat_send(
@@ -604,7 +662,7 @@ async def chat_send(
                 "Enforce UTM hygiene; centralize campaign ROI in one view.",
                 "Stand up a churn save motion for at-risk segments.",
             ]
-        # CPO = Chief People Officer (your requested 5th brain)
+        # CPO = Chief People Officer
         return [
             "Clarify success profile per role; share example work samples.",
             "Shorten time-to-hire: pre-book panels and scorecards.",
@@ -636,9 +694,6 @@ async def chat_send(
         lines.append("")  # spacer between CXOs
 
     assistant_content = "\n".join(lines)
-
-    # Gate only if you want different behavior by tier; for now we show same
-    # structure to all tiers so Premium/Pro+ get the full CXO output consistently.
 
     # persist assistant message
     amsg = ChatMessage(session_id=s.id, user_id=user.id, role="assistant",
