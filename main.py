@@ -618,6 +618,6 @@ async def admin_users_alias(
 # (Chat/Admin routers) — only mounted if present in the repo
 # --------------------------------------------------------------------------------------
 if chat_router:
-    app.include_router(chat_router)
+    app.include_router(chat_router, prefix="/api/chat", tags=["chat"])
 if admin_router:
-    app.include_router(admin_router)
+    app.include_router(admin_router, prefix="/api/admin", tags=["admin"])
