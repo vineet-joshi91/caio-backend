@@ -132,7 +132,7 @@ def _env_set(name: str) -> set:
     raw = os.getenv(name, "")
     return {e.strip().lower() for e in raw.split(",") if e.strip()}
 
-ADMIN_EMAILS      = _env_set("ADMIN_EMAILS")
+ADMIN_EMAILS      = _env_set("ADMIN_EMAIL")
 PREMIUM_EMAILS    = _env_set("PREMIUM_EMAILS")
 PRO_PLUS_EMAILS   = _env_set("PRO_PLUS_EMAILS")
 PRO_TEST_EMAILS   = _env_set("PRO_TEST_EMAILS")
