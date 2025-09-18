@@ -61,45 +61,48 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="CAIO Backend", version="0.7.0", lifespan=lifespan)
 
 # --------------------------------------------------------------------------------------
-# CORS (hardened for Vercel/Netlify previews + local dev)
+# CORS (prod + previews + local) + a tiny fallback to always stamp headers
 # --------------------------------------------------------------------------------------
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 
-# Explicit allowlist (prod + local)
 ALLOWED_ORIGINS = [
     "https://caio-frontend.vercel.app",
     "https://caioai.netlify.app",
     "http://localhost:3000",
     "http://127.0.0.1:3000",
 ]
-
-# Optional comma-separated extras via env (e.g., custom domains)
 extra = (os.getenv("ALLOWED_ORIGINS") or "").strip()
 if extra:
     ALLOWED_ORIGINS += [o.strip() for o in extra.split(",") if o.strip()]
 
-# Regex covers preview deployments like https://<hash>-caio-frontend.vercel.app etc.
-# Also covers Netlify previews.
 ALLOW_ORIGIN_REGEX = r"https://.*\.vercel\.app|https://.*\.netlify\.app"
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,      # exact matches
-    allow_origin_regex=ALLOW_ORIGIN_REGEX,  # preview subdomains
-    allow_credentials=True,             # auth header/cookies allowed
-    allow_methods=["*"],                # POST/GET/OPTIONS/etc.
-    allow_headers=["*"],                # Authorization, Content-Type, etc.
+    allow_origins=ALLOWED_ORIGINS,
+    allow_origin_regex=ALLOW_ORIGIN_REGEX,   # cover preview subdomains
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
     expose_headers=["*"],
     max_age=86400,
 )
 
-# Robust preflight helper: ensure CORS headers are present even on OPTIONS
-# (Starlette CORS should handle this, but we make it explicit.)
-from fastapi.responses import Response
-
+# OPTIONS preflight (Starlette adds headers; we still return a clean 204)
 @app.options("/{path:path}")
 def cors_preflight(path: str):
     return Response(status_code=204)
+
+# Extra belt-and-suspenders: guarantee CORS headers even on unhandled exceptions
+@app.middleware("http")
+async def ensure_cors_headers(request, call_next):
+    try:
+        response = await call_next(request)
+    except Exception:
+        # crash-safe response (still gets CORS by virtue of middleware order)
+        response = Response("Internal Server Error", status_code=500)
+    return response
 
 # --------------------------------------------------------------------------------------
 # Health / Ready
@@ -580,53 +583,144 @@ async def chat_send(
     request: Request,
     db: Session = Depends(get_db),
     current: User = Depends(get_current_user),
-    message: Optional[str] = Form(None),
-    brief: Optional[str] = Form(None),
-    session_id: Optional[int] = Form(None),
 ):
     """
-    Returns: Insights (top) + CXO-only Recommendations for CFO/CHRO/COO/CMO/CPO.
-    Uses filenames + brief/message to craft lightweight, deterministic output so the UI renders
-    the same structure across tiers. You can swap the inner 'assistant_content' with your LLM
-    answer later without touching the response shape.
+    Accepts multipart/form-data with optional file(s) and fields:
+      - message (str)
+      - brief (str)
+      - session_id (int)
+    Returns Insights + CXO-only Recommendations (CFO/CHRO/COO/CMO/CPO).
     """
     user = apply_tier_overrides(current)
     tier = _user_tier(user)
 
-    # Parse multipart to capture filenames if present (no hard dependency on files)
+    # ---- Parse the body ONCE ----
+    message: Optional[str] = None
+    brief: Optional[str] = None
+    session_id: Optional[int] = None
     filenames: List[str] = []
+
     try:
         form = await request.form()
+        message = (form.get("message") or None)
+        brief = (form.get("brief") or None)
+        sid = form.get("session_id")
+        session_id = int(sid) if sid else None
+        # collect uploaded filenames (if any)
         for v in form.values():
             if hasattr(v, "filename") and getattr(v, "filename"):
                 filenames.append(v.filename)
-        # fallback to explicit message/brief if body was multipart
-        if message is None:
-            message = form.get("message")
-        if brief is None:
-            brief = form.get("brief")
-        if session_id is None:
-            sid = form.get("session_id")
-            session_id = int(sid) if sid else None
     except Exception:
-        pass
+        # If not multipart, try JSON (some clients send JSON only)
+        try:
+            data = await request.json()
+            if isinstance(data, dict):
+                message = (data.get("message") or None)
+                brief = (data.get("brief") or None)
+                sid = data.get("session_id")
+                session_id = int(sid) if sid else None
+        except Exception:
+            pass
 
-    # ensure session
+    # ---- Ensure a session ----
     s: Optional[ChatSession] = None
     if session_id:
-        s = db.query(ChatSession).filter(ChatSession.id == session_id,
-                                         ChatSession.user_id == user.id).first()
+        s = db.query(ChatSession).filter(
+            ChatSession.id == session_id,
+            ChatSession.user_id == user.id
+        ).first()
     if not s:
         s = ChatSession(user_id=user.id, created_at=datetime.utcnow())
         db.add(s); db.commit(); db.refresh(s)
 
-    # persist user message
-    user_text = (message or brief or "").strip()
+    # ---- Persist user message ----
+    user_text = ((message or brief or "").strip()) or "(no message)"
     hint = (f"\n\n[files] {', '.join(filenames)}" if filenames else "")
-    umsg = ChatMessage(session_id=s.id, user_id=user.id, role="user",
-                       content=(user_text + hint) if (user_text or hint) else "(no message)",
-                       created_at=datetime.utcnow())
+    umsg = ChatMessage(
+        session_id=s.id,
+        user_id=user.id,
+        role="user",
+        content=(user_text + hint),
+        created_at=datetime.utcnow()
+    )
     db.add(umsg); db.commit()
+
+    # ---- Deterministic scaffold (Insights + CXO recs) ----
+    doc_hint = ", ".join(filenames) if filenames else "attached context"
+    brief_hint = (brief or message or "your document").strip()
+
+    insights = [
+        f"The submission includes {('files: ' + doc_hint) if filenames else 'text input only'}, suitable for CXO review.",
+        "Content appears narrative/strategic rather than raw telemetry; summarize themes before diving into metrics.",
+        "Capture any explicit asks in the brief to align next steps and owners.",
+    ]
+
+    def recs_for(role: str) -> List[str]:
+        base = brief_hint if brief_hint else "the current context"
+        if role == "CFO":
+            return [
+                f"Validate revenue/expense drivers referenced in {base} against latest actuals.",
+                "Set a weekly variance check and flag deltas >3% to the owner.",
+                "Tighten working capital — review AR aging and vendor terms.",
+                "Pressure-test unit economics; agree the one true CAC/LTV view.",
+                "Publish a one-page runway/threshold update for the exec team.",
+            ]
+        if role == "CHRO":
+            return [
+                "Map roles to outcomes; clarify ‘must-win’ competencies this quarter.",
+                "Launch a pulse check; track participation and eNPS by function.",
+                "Pre-brief managers on upcoming changes; supply talking points.",
+                "Create a hiring freeze exception path tied to business impact.",
+                "Stand up an attrition review: leavers by tenure/manager/root cause.",
+            ]
+        if role == "COO":
+            return [
+                "Instrument the critical path; surface SLA breaches daily.",
+                f"Create a doc-to-ops handoff checklist specific to {base}.",
+                "Run a 5-whys on the slowest hop and remove one constraint.",
+                "Add QA spot-checks on high-variance work items.",
+                "Publish a weekly ‘cost-to-serve’ snapshot with trend arrows.",
+            ]
+        if role == "CMO":
+            return [
+                "Align messaging with the top three buyer pains surfaced here.",
+                "Commit one growth loop (referrals, content, partner) and own it.",
+                "Tidy the funnel; fix drop-offs with one experiment per stage.",
+                "Enforce UTM hygiene; centralize campaign ROI in one view.",
+                "Stand up a churn save motion for at-risk segments.",
+            ]
+        # CPO
+        return [
+            "Clarify success profile per role; share example work samples.",
+            "Shorten time-to-hire: pre-book panels and scorecards.",
+            "Upskill managers on feedback that moves performance quickly.",
+            "Codify onboarding ‘day-1 to day-30’ outcomes and buddies.",
+            "Track diversity of pipeline and close gaps with targeted sourcing.",
+        ]
+
+    CXOS = [("CFO","Chief Financial Officer"),("CHRO","Chief Human Resources Officer"),
+            ("COO","Chief Operating Officer"),("CMO","Chief Marketing Officer"),
+            ("CPO","Chief People Officer")]
+
+    lines: List[str] = []
+    lines.append("## Insights")
+    for i, bullet in enumerate(insights, 1):
+        lines.append(f"{i}. {bullet}")
+    lines.append("")
+    for code, full in CXOS:
+        lines.append(f"### {code} ({full})")
+        lines.append("**Recommendations**")
+        for i, r in enumerate(recs_for(code), 1):
+            lines.append(f"{i}. {r}")
+        lines.append("")
+
+    assistant_content = "\n".join(lines)
+    amsg = ChatMessage(session_id=s.id, user_id=user.id, role="assistant",
+                       content=assistant_content, created_at=datetime.utcnow())
+    db.add(amsg); db.commit()
+
+    return {"ok": True, "session_id": s.id,
+            "assistant": {"role": "assistant", "content": assistant_content}}
 
     # ---------- Lightweight, deterministic “Insights + CXO recs” scaffold ----------
     # Inputs for flavoring:
